@@ -1,0 +1,19 @@
+# Dados e artefatos gerados
+data/
+jars/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# dbt
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+
+# Local
+.env
+.probe
