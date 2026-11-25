@@ -1,0 +1,7 @@
+# Versões pinadas em 25/11/2026 (Dia 2). Python 3.12 via uv.
+# pyspark 4.3.0 → conector Kafka correspondente é org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0
+pyspark==4.3.0
+confluent-kafka==2.16.2
+psycopg[binary]==3.3.9
+pandas==2.3.3            # 3.x ainda nao suportado pelo PySpark 4.3
+pyarrow==26.0.1
