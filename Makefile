@@ -33,7 +33,7 @@ produce: ## Replay do TLC Parquet para trips.raw (RATE=500 LIMIT=20000; 0 = sem 
 	@$(COMPOSE) exec -T redpanda rpk cluster info >/dev/null 2>&1 || { echo "redpanda fora do ar — rode 'make up'"; exit 1; }
 	@parts=$$($(COMPOSE) exec -T redpanda rpk topic describe $(TOPIC) 2>/dev/null | awk '$$1 == "PARTITIONS" {print $$2}'); \
 	  test "$$parts" = "6" || { echo "topico $(TOPIC) com particoes=$${parts:-0} (esperado 6) — rode 'make topic'"; exit 1; }
-	@uv run python producer/producer.py --rate $(RATE) --limit $(LIMIT) --raw-dir $(RAW_DIR)
+	@uv run python producer/producer.py --rate $(RATE) --limit $(LIMIT) --topic $(TOPIC) --raw-dir $(RAW_DIR)
 
 venv: ## Cria a venv com Python 3.12 (uv lê .python-version; preserva a existente)
 	uv venv --python 3.12 --allow-existing

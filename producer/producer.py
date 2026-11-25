@@ -38,6 +38,12 @@ MESSAGE_TIMEOUT_MS = 30_000
 # chegarem e o processo sairia com "0 falhas" depois de perder mensagem em silêncio.
 FLUSH_TIMEOUT_S = 45.0
 MAX_ERROR_SAMPLES = 5
+# Broker que não recebe: insistir só repete o timeout. 100 falhas já é sinal de que algo está errado.
+ABORT_AFTER_FAILURES = 100
+
+
+class AbortReplay(RuntimeError):
+    """Falhas de entrega demais: melhor parar do que seguir empilhando timeouts."""
 
 log = logging.getLogger("producer")
 
@@ -117,21 +123,25 @@ def run(args: argparse.Namespace) -> int:
             "message.timeout.ms": MESSAGE_TIMEOUT_MS,
         }
     )
-    failures = 0
+    delivery_failures = 0
     error_samples: list[str] = []
 
     def on_delivery(err: Any, msg: Any) -> None:
-        nonlocal failures
+        nonlocal delivery_failures
         if err is not None:
-            failures += 1
+            delivery_failures += 1
             if len(error_samples) < MAX_ERROR_SAMPLES:
                 error_samples.append(f"{msg.topic()}[{msg.partition()}]@{msg.offset()}: {err}")
 
     def send(event: dict[str, Any]) -> None:
-        """Envia sem estourar a fila local quando o replay vai sem freio."""
+        """Envia sem estourar a fila local; para quando o broker já recusou demais."""
         key = partition_key(event)
         payload = dumps(event)
         while True:
+            if delivery_failures >= ABORT_AFTER_FAILURES:
+                raise AbortReplay(
+                    f"{delivery_failures} falhas de entrega: o broker não está recebendo"
+                )
             try:
                 producer.produce(args.topic, key=key, value=payload, on_delivery=on_delivery)
                 return
@@ -151,6 +161,8 @@ def run(args: argparse.Namespace) -> int:
             if args.limit and sent >= args.limit:
                 break
             log.info("replay %s", path.name)
+            # a leitura/ordenação de cada mês não vira crédito de ritmo (rajada na fronteira)
+            paced_start = None
             for row in iter_rows(path):
                 if args.limit and sent >= args.limit:
                     break
@@ -177,10 +189,11 @@ def run(args: argparse.Namespace) -> int:
                     )
                     window_start = now
                     window_count = 0
+    except AbortReplay as exc:
+        log.error("%s", exc)
     finally:
         pending = producer.flush(FLUSH_TIMEOUT_S)
-        if pending:
-            failures += pending
+        if pending and len(error_samples) < MAX_ERROR_SAMPLES:
             error_samples.append(
                 f"{pending} mensagens sem confirmação em {FLUSH_TIMEOUT_S:.0f}s (message.timeout "
                 f"{MESSAGE_TIMEOUT_MS}ms)"
@@ -188,14 +201,16 @@ def run(args: argparse.Namespace) -> int:
 
     elapsed = time.monotonic() - started
     log.info(
-        "fim: %d enviados, %d ignorados (pickup nulo), %d falhas de entrega em %.1fs = %.0f ev/s",
+        "fim: %d enviados, %d ignorados (pickup nulo), %d falhas de entrega, %d sem confirmação, "
+        "em %.1fs = %.0f ev/s",
         sent,
         skipped,
-        failures,
+        delivery_failures,
+        pending,
         elapsed,
         sent / elapsed if elapsed else 0.0,
     )
-    if failures:
+    if delivery_failures or pending:
         log.error("primeiras falhas: %s", "; ".join(error_samples))
         return 1
     if args.limit and sent < args.limit:

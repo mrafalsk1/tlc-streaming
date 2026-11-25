@@ -110,6 +110,20 @@ Descartado, com motivo:
 - **`EVENT_FIELDS` divergir do dict**: vira teste no Dia 4 (`tuple(event) == EVENT_FIELDS`), que é
   onde a checagem paga; em runtime seria custo por evento.
 
+Follow-up da revisão (mesmo revisor), aplicado:
+
+- **Rajada na fronteira de mês**: a âncora do `--rate` é zerada a cada arquivo, então a
+  leitura/ordenação do mês seguinte não entra como crédito de ritmo.
+- **Broker fora do ar**: `send()` aborta o replay depois de `ABORT_AFTER_FAILURES = 100` falhas de
+  entrega (`AbortReplay`, exit 1) em vez de seguir até o fim empilhando timeouts.
+- **Contagem dupla**: "falhas de entrega" (callbacks) e "sem confirmação" (`pending` do flush) agora
+  são contadores separados no log; a amostra de `pending` respeita `MAX_ERROR_SAMPLES`.
+- `make produce` passa `--topic $(TOPIC)` ao produtor (antes o guard checava um tópico e o produtor
+  escrevia em `trips.raw`).
+- Contabilidade conferida com broker morto: `--brokers localhost:9999 --limit 150` → 150 enviados,
+  **150 falhas de entrega, 0 sem confirmação**, exit 1 em 31,0 s (tudo estoura em `message.timeout`;
+  nada sai como "0 falhas").
+
 A provar no Dia 5, antes de o Silver gravar:
 
 - `emit_time` sai como `2026-11-25T19:06:16.482+00:00`: o Spark 4 aplica
