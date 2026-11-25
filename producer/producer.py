@@ -33,7 +33,11 @@ from producer.schema import SOURCE_COLUMNS, build_event, dumps, partition_key
 DEFAULT_RAW_DIR = Path(os.environ.get("TLC_RAW_DIR", "~/projetos/tlc-elt/data/raw")).expanduser()
 DEFAULT_BROKERS = os.environ.get("KAFKA_BROKERS", "localhost:9092")
 CHUNK_ROWS = 10_000
-FLUSH_TIMEOUT_S = 30.0
+MESSAGE_TIMEOUT_MS = 30_000
+# O flush espera mais que o timeout da mensagem, senão ele desiste antes de os callbacks de erro
+# chegarem e o processo sairia com "0 falhas" depois de perder mensagem em silêncio.
+FLUSH_TIMEOUT_S = 45.0
+MAX_ERROR_SAMPLES = 5
 
 log = logging.getLogger("producer")
 
@@ -110,18 +114,35 @@ def run(args: argparse.Namespace) -> int:
             "enable.idempotence": True,
             "compression.type": "lz4",
             "linger.ms": 5,
-            "message.timeout.ms": 60_000,
+            "message.timeout.ms": MESSAGE_TIMEOUT_MS,
         }
     )
-    errors: list[str] = []
+    failures = 0
+    error_samples: list[str] = []
 
     def on_delivery(err: Any, msg: Any) -> None:
+        nonlocal failures
         if err is not None:
-            errors.append(f"{msg.topic()}[{msg.partition()}]@{msg.offset()}: {err}")
+            failures += 1
+            if len(error_samples) < MAX_ERROR_SAMPLES:
+                error_samples.append(f"{msg.topic()}[{msg.partition()}]@{msg.offset()}: {err}")
+
+    def send(event: dict[str, Any]) -> None:
+        """Envia sem estourar a fila local quando o replay vai sem freio."""
+        key = partition_key(event)
+        payload = dumps(event)
+        while True:
+            try:
+                producer.produce(args.topic, key=key, value=payload, on_delivery=on_delivery)
+                return
+            except BufferError:
+                # fila local cheia: serve callbacks para liberar espaço e tenta de novo
+                producer.poll(0.5)
 
     sent = 0
     skipped = 0
     started = time.monotonic()
+    paced_start: float | None = None
     window_start = started
     window_count = 0
 
@@ -136,17 +157,14 @@ def run(args: argparse.Namespace) -> int:
                 if row.get("tpep_pickup_datetime") is None:
                     skipped += 1
                     continue
-                event = build_event(row, datetime.now(UTC))
-                producer.produce(
-                    args.topic,
-                    key=partition_key(event),
-                    value=dumps(event),
-                    on_delivery=on_delivery,
-                )
+                send(build_event(row, datetime.now(UTC)))
                 sent += 1
                 window_count += 1
-                producer.poll(0)  # entrega callbacks e drena o buffer local
-                pace(started, sent, args.rate)
+                producer.poll(0)  # serve os callbacks de entrega (não drena a fila de produção)
+                if paced_start is None:
+                    # âncora depois do primeiro envio: a ordenação do mês não vira burst de crédito
+                    paced_start = time.monotonic()
+                pace(paced_start, sent, args.rate)
 
                 now = time.monotonic()
                 if now - window_start >= args.log_every:
@@ -162,19 +180,23 @@ def run(args: argparse.Namespace) -> int:
     finally:
         pending = producer.flush(FLUSH_TIMEOUT_S)
         if pending:
-            log.error("%d mensagens não saíram em %.0fs", pending, FLUSH_TIMEOUT_S)
+            failures += pending
+            error_samples.append(
+                f"{pending} mensagens sem confirmação em {FLUSH_TIMEOUT_S:.0f}s (message.timeout "
+                f"{MESSAGE_TIMEOUT_MS}ms)"
+            )
 
     elapsed = time.monotonic() - started
     log.info(
         "fim: %d enviados, %d ignorados (pickup nulo), %d falhas de entrega em %.1fs = %.0f ev/s",
         sent,
         skipped,
-        len(errors),
+        failures,
         elapsed,
         sent / elapsed if elapsed else 0.0,
     )
-    if errors:
-        log.error("primeiras falhas: %s", "; ".join(errors[:5]))
+    if failures:
+        log.error("primeiras falhas: %s", "; ".join(error_samples))
         return 1
     if args.limit and sent < args.limit:
         log.error("limite de %d não alcançado: só %d eventos disponíveis", args.limit, sent)

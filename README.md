@@ -9,12 +9,12 @@ in this README is estimated.
 
 ```
 Parquet TLC
-   │  producer (replay in pickup_at order, rate limited)
+   │  producer (replay in pickup_at order, rate limited)        ← implemented (day 3)
    ▼
 Redpanda  topic: trips.raw (6 partitions, key = pickup_zone_id, retention 24h)
    │
    ▼
-Spark Structured Streaming (10s trigger)
+Spark Structured Streaming (10s trigger)                       ← target, days 5-10
    ├─ Bronze: raw append Parquet  data/bronze/
    └─ Silver (Postgres): validated, late-filtered, deduplicated by trip_id
    │

@@ -51,7 +51,9 @@ Cheques verdes:
 
 - `uv run ruff check producer` → `All checks passed!`.
 - `uv run python producer/producer.py --rate 500 --limit 20000` → **20.000 enviados, 0 ignorados,
-  0 falhas de entrega em 40,0 s = 500 ev/s** (relógio do shell: 40,28 s).
+  0 falhas de entrega em 40,0 s = 500 ev/s** (relógio do shell: 40,28 s). Depois da revisão
+  independente, o mesmo aceite dá **40,5 s = 494 ev/s** — a diferença é a leitura/ordenação do mês
+  (~0,4 s) que passou a ficar fora da âncora do ritmo; o log de janela fica em 500 ev/s.
 - Sem freio (`--rate 0`) a mesma leitura sai a **~4.100 ev/s** (2.000 eventos em 0,5 s, já incluindo a
   ordenação do mês inteiro) — teto do produtor, a confirmar com 100k no Dia 4.
 - Determinismo: dois runs de 2.000 num tópico descartável (`trips.smoke`, apagado em seguida) →
@@ -80,3 +82,40 @@ Tropeço: rodando como script (`uv run python producer/producer.py`), o `sys.pat
 com `producer/__init__.py` mais uma linha que põe a raiz do repo no `sys.path` quando não há pacote.
 Também: `# noqa: E402` no import foi acusado pelo ruff (`RUF100`, regra não habilitada no default);
 o import ficou sem `noqa`.
+
+### Revisão independente do Dia 3 (o que mudou)
+
+Aplicado:
+
+- **Flush podia esconder perda** (alto): `message.timeout.ms` (60 s) era maior que o timeout do
+  `flush` (30 s), e `pending > 0` só virava log — o processo podia sair com "0 falhas". Agora
+  `message.timeout.ms = 30 s`, `flush(45 s)` e `pending` soma em `failures` (exit 1).
+- **`BufferError` no replay sem freio** (médio): a fila local (100k mensagens) podia estourar e
+  abortar o run com traceback; agora `poll(0.5)` e reenvio, dentro de um `send()`.
+- **Burst inicial** (médio): o `--rate` contava o tempo da ordenação do mês como crédito; a âncora do
+  ritmo passou para o primeiro envio (a média de 20k não mudou).
+- Amostras de erro limitadas a 5, com contador separado; comentário do `poll(0)` corrigido (ele serve
+  callbacks de entrega, não drena a fila de produção).
+- `make produce` distingue "redpanda fora do ar" de "tópico ausente" e exige **6 partições**
+  (`retention.ms` já era conferido no Dia 1).
+- README: diagrama marca `producer` como implementado e Spark/Bronze/Silver/dbt como alvo (Dias 5–10).
+
+Descartado, com motivo:
+
+- **"`sort_indices` não é estável"**: a doc do pyarrow diz o contrário — "computes an array of indices
+  that define a **stable** sort". Empate mantém a ordem do arquivo, e a checagem de determinismo
+  compara o multiconjunto de `trip_id`; nada a mudar.
+- **Filtrar pickup nulo em dois lugares** (produtor e `build_event`): é defesa em profundidade — o
+  produtor evita a exceção no caminho quente e `build_event` continua recusando linha sem pickup.
+- **`EVENT_FIELDS` divergir do dict**: vira teste no Dia 4 (`tuple(event) == EVENT_FIELDS`), que é
+  onde a checagem paga; em runtime seria custo por evento.
+
+A provar no Dia 5, antes de o Silver gravar:
+
+- `emit_time` sai como `2026-11-25T19:06:16.482+00:00`: o Spark 4 aplica
+  `spark.sql.session.timeZone` ao converter string com offset para `TimestampType`. Se o JSON real
+  mostrar deslocamento, trocar por epoch millis.
+- Ler o tópico com `from_json` + schema explícito, nunca `inferSchema`: `payment_type` é int64 em
+  todos os arquivos, mas um lote todo nulo inferiria outro tipo e o append no Bronze conflitaria.
+- Key `unknown` é só transporte (o payload tem `pickup_zone_id`); não fazer `cast(key AS int)`.
+- `trip_id` usa `total_amount` formatado em `%.2f`: corrida com mais casas colidiria no PK do Silver.
