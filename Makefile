@@ -2,6 +2,11 @@
 COMPOSE := docker compose
 TOPIC ?= trips.raw
 
+# Replay de amostra (Dia 3). Run completo: `make produce RATE=0 LIMIT=0`.
+RATE ?= 500
+LIMIT ?= 20000
+RAW_DIR ?= $(HOME)/projetos/tlc-elt/data/raw
+
 # Spark 4 não homologa o JDK 27 (default do repo): fixar o 21.
 # `:=` de propósito: um JAVA_HOME exportado no shell (archlinux-java, SDKMAN) não pode vencer em silêncio.
 JAVA_HOME := /usr/lib/jvm/java-21-openjdk
@@ -23,6 +28,10 @@ clean: ## Derruba e apaga os volumes (perde tópico e banco)
 
 topic: ## Cria o tópico trips.raw (idempotente)
 	@bash scripts/create_topic.sh
+
+produce: ## Replay do TLC Parquet para trips.raw (RATE=500 LIMIT=20000; 0 = sem limite)
+	@$(COMPOSE) exec -T redpanda rpk topic describe $(TOPIC) >/dev/null 2>&1 || { echo "topico $(TOPIC) ausente — rode 'make topic'"; exit 1; }
+	@uv run python producer/producer.py --rate $(RATE) --limit $(LIMIT) --raw-dir $(RAW_DIR)
 
 venv: ## Cria a venv com Python 3.12 (uv lê .python-version; preserva a existente)
 	uv venv --python 3.12 --allow-existing
@@ -52,4 +61,4 @@ ps: ## Estado dos containers
 logs: ## Logs do Redpanda
 	@$(COMPOSE) logs -f redpanda
 
-.PHONY: help up down clean topic venv deps check-java smoke silver silver-reset ps logs
+.PHONY: help up down clean topic produce venv deps check-java smoke silver silver-reset ps logs
