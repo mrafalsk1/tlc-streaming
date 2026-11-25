@@ -2,12 +2,15 @@ name: tlc-streaming
 
 services:
   redpanda:
-    image: redpandadata/redpanda:latest
+    image: redpandadata/redpanda:v26.3.1   # pinado: foi a versão validada no Dia 1
+    restart: unless-stopped                 # sem isto o stack não volta quando o WSL reinicia
     # Dois listeners: o externo (9092) é anunciado como localhost para o host;
     # o interno (29092) é anunciado como "redpanda" para o Console, dentro da rede.
     command: >
       redpanda start
       --smp 1
+      --memory 2G
+      --reserve-memory 0M
       --overprovisioned
       --node-id 0
       --kafka-addr PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092
@@ -24,7 +27,8 @@ services:
       retries: 12
 
   console:
-    image: redpandadata/console:latest
+    image: redpandadata/console@sha256:aa055a971965606f89c00cc2367e38c95f93f0cb3a4ff96701cbb117af8e23f8
+    restart: unless-stopped
     environment:
       KAFKA_BROKERS: redpanda:29092
     ports:
@@ -35,6 +39,7 @@ services:
 
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: stream
       POSTGRES_PASSWORD: stream
