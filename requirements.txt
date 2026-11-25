@@ -5,3 +5,6 @@ confluent-kafka==2.16.2
 psycopg[binary]==3.3.9
 pandas==2.3.3            # 3.x ainda nao suportado pelo PySpark 4.3
 pyarrow==26.0.1
+# Ferramentas do Dia 4 (uv run pytest / uv run ruff) — pinadas aqui para não instalar solto.
+pytest==9.2.0
+ruff==0.17.6
