@@ -1,8 +1,8 @@
-"""Ramo Silver sem broker e sem Postgres: invalidez, atraso, identidade do lote e graváveis.
+"""Silver branch without broker or Postgres: invalidity, late data, batch identity and storable rows.
 
-O upsert/livro-caixa em si são cobertos pelo run de laboratório (o teste unitário não sobe Postgres).
-Aqui ficam as decisões que podem quebrar em silêncio: qual regra invalida, qual atraso é descartado,
-o que não tem como entrar na PK/NOT NULL, a serialização dos tempos e a identidade do lote.
+The upsert/ledger itself is covered by the lab run (the unit test does not start Postgres). What
+stays here are the decisions that can break silently: which rule invalidates, which lateness is
+dropped, what cannot enter the PK/`NOT NULL`, the timestamp serialization and the batch identity.
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ EVENT = {
     "trip_distance": 2.4,
     "emit_time": "2024-01-01T12:00:00.000+00:00",
 }
-# Aware de propósito: `createDataFrame` converte `datetime` naive no fuso da máquina, e o teste
-# não pode depender do `TZ` de quem roda.
+# Aware on purpose: `createDataFrame` converts naive `datetime` in the machine timezone, and the
+# test cannot depend on the runner's `TZ`.
 INGESTED_AT = datetime(2024, 1, 1, 12, 5, tzinfo=UTC)
 
 INPUT_SCHEMA = T.StructType(
@@ -76,18 +76,18 @@ def frame(spark: SparkSession, *events: dict):
     ("overrides", "valid"),
     [
         ({}, True),
-        # as cinco regras do contrato
+        # the five contract rules
         ({"trip_id": None}, False),
         ({"pickup_zone_id": None}, False),
-        ({"dropoff_at": "2024-01-01T00:12:00"}, False),  # duração zero
-        ({"dropoff_at": "2024-01-01T00:07:00"}, False),  # duração negativa
+        ({"dropoff_at": "2024-01-01T00:12:00"}, False),  # zero duration
+        ({"dropoff_at": "2024-01-01T00:07:00"}, False),  # negative duration
         ({"fare_amount": -0.01}, False),
         ({"total_amount": 10_000.01}, False),
-        # limites e nulos: nulo não invalida (senão o nulo viraria falso negativo)
+        # limits and nulls: a null does not invalidate (otherwise the null would be a false negative)
         ({"total_amount": 10_000.0}, True),
         ({"fare_amount": None}, True),
         ({"dropoff_at": None}, True),
-        # o teto usa o total arredondado a 2 casas, igual ao `trip_id` do produtor (`%.2f`)
+        # the ceiling uses the total rounded to 2 decimals, same as the producer `trip_id` (`%.2f`)
         ({"total_amount": 10_000.004}, True),
         ({"total_amount": 10_000.006}, False),
     ],
@@ -107,11 +107,11 @@ def test_timestamps_keep_the_naive_new_york_wall_clock(spark) -> None:
     lag = prepared.collect()[0].lag_seconds
     row = copy_frame(prepared).collect()[0]
 
-    # O texto é naive de NY: o COPY carrega o mesmo relógio de parede, sem deslocar.
+    # The text is New York naive: the COPY carries the same wall clock, without shifting.
     assert row.pickup_at == "2024-01-01 00:12:00.000000"
     assert row.event_time == row.pickup_at
     assert row.dropoff_at == "2024-01-01 00:27:00.000000"
-    # emit_time tem offset e ingested_at é instante: os dois saem no relógio UTC da sessão.
+    # emit_time has an offset and ingested_at is an instant: both come out in the session UTC clock.
     assert row.emit_time == "2024-01-01 12:00:00.000000"
     assert row.ingested_at == "2024-01-01 12:05:00.000000"
     assert lag == pytest.approx(300.0)
@@ -121,7 +121,7 @@ def test_first_batch_accepts_the_2002_outlier(spark) -> None:
     outlier = event(event_time="2002-12-31T23:00:00", dropoff_at="2002-12-31T23:10:00")
     prepared = to_silver_events(frame(spark, outlier))
 
-    # Watermark NULL = aceita tudo; com o max do próprio lote o outlier morreria aqui.
+    # NULL watermark = accept everything; with the batch's own max the outlier would die here.
     assert apply_late_filter(prepared, None).count() == 1
 
 
@@ -129,10 +129,10 @@ def test_late_filter_drops_only_more_than_ten_minutes_behind(spark) -> None:
     prepared = to_silver_events(
         frame(
             spark,
-            event(trip_id="atrasado", event_time="2024-01-01T11:49:00"),
-            event(trip_id="no_limite", event_time="2024-01-01T11:50:00"),
-            event(trip_id="em_dia", event_time="2024-01-01T12:00:00"),
-            event(trip_id="sem_tempo", event_time=None),
+            event(trip_id="late_event", event_time="2024-01-01T11:49:00"),
+            event(trip_id="on_the_edge", event_time="2024-01-01T11:50:00"),
+            event(trip_id="on_time", event_time="2024-01-01T12:00:00"),
+            event(trip_id="no_time", event_time=None),
         )
     )
 
@@ -140,8 +140,8 @@ def test_late_filter_drops_only_more_than_ten_minutes_behind(spark) -> None:
         row.trip_id
         for row in apply_late_filter(prepared, datetime(2024, 1, 1, 12, 0)).collect()
     }
-    # Linha sem event_time não é julgada pelo atraso; ela cai no filtro de graváveis.
-    assert kept == {"no_limite", "em_dia", "sem_tempo"}
+    # A row without event_time is not judged by lateness; it falls into the storable filter.
+    assert kept == {"on_the_edge", "on_time", "no_time"}
 
 
 def test_late_and_unstorable_is_counted_once(spark) -> None:
@@ -149,14 +149,14 @@ def test_late_and_unstorable_is_counted_once(spark) -> None:
         frame(
             spark,
             event(trip_id=None, event_time="2024-01-01T11:00:00"),
-            event(trip_id="em_dia", event_time="2024-01-01T12:00:00"),
+            event(trip_id="on_time", event_time="2024-01-01T12:00:00"),
         )
     )
 
     accepted = apply_late_filter(prepared, datetime(2024, 1, 1, 12, 0))
     storable = storable_filter(accepted)
 
-    # A linha atrasada sai antes do filtro de graváveis: conta como late, não como rejeitada.
+    # The late row leaves before the storable filter: it counts as late, not as rejected.
     assert accepted.count() == 1
     assert storable.count() == 1
 
@@ -167,15 +167,15 @@ def test_rows_without_key_or_not_null_columns_are_not_storable(spark) -> None:
             spark,
             event(trip_id="ok"),
             event(trip_id=None),
-            event(trip_id="sem_pickup", event_time=None),
-            event(trip_id="sem_emit", emit_time=None),
-            event(trip_id="com_nul\x00aqui"),
-            event(trip_id="com\ttab"),
+            event(trip_id="no_pickup", event_time=None),
+            event(trip_id="no_emit", emit_time=None),
+            event(trip_id="with_nul\x00here"),
+            event(trip_id="with\ttab"),
         )
     )
 
-    # PK/NOT NULL ausentes e NUL (que o COPY recusa) não podem entrar: contam em `rejected`.
-    # TAB/quebra de linha o psycopg escapa, então continuam graváveis.
+    # Missing PK/NOT NULL and NUL (which the COPY refuses) cannot enter: they count as `rejected`.
+    # TAB/newline are escaped by psycopg, so they remain storable.
     assert storable_filter(prepared).count() == 2
 
 
@@ -184,13 +184,14 @@ def test_invalid_row_with_key_is_still_storable(spark) -> None:
 
     row = prepared.collect()[0]
     assert row.is_valid_trip is False
-    # Inválido é dado: entra no Silver para a reconciliação; só quem não cabe na PK/NOT NULL sai.
+    # Invalid is data: it enters the Silver for the reconciliation; only what cannot fit the
+    # PK/NOT NULL leaves.
     assert storable_filter(prepared).count() == 1
 
 
 def test_malformed_timestamp_does_not_raise(spark) -> None:
-    # ANSI ligado no Spark 4: `to_timestamp` levantaria exceção e travaria o lote; `try_` devolve nulo.
-    prepared = to_silver_events(frame(spark, event(event_time="nao-e-data")))
+    # ANSI on in Spark 4: `to_timestamp` would raise and stall the batch; `try_` returns null.
+    prepared = to_silver_events(frame(spark, event(event_time="not-a-date")))
     row = prepared.collect()[0]
 
     assert row.pickup_at is None
@@ -198,7 +199,7 @@ def test_malformed_timestamp_does_not_raise(spark) -> None:
 
 
 def test_out_of_range_amount_is_invalid_not_fatal(spark) -> None:
-    # Acima do que o NUMERIC(10,2) aceita: o valor vira NULL, mas a linha não pode sair como válida.
+    # Above what NUMERIC(10,2) accepts: the value becomes NULL, but the row cannot leave as valid.
     prepared = to_silver_events(frame(spark, event(fare_amount=1e20)))
     row = prepared.collect()[0]
 
@@ -220,13 +221,13 @@ def test_batch_bounds_identity_and_slowest_partition(spark) -> None:
     key, watermark = batch_bounds(batch)
 
     assert key == "0:100-101;1:200-201"
-    # A partição 1 é a mais atrasada em event-time: é ela quem define o watermark.
+    # Partition 1 is the most behind in event-time: it defines the watermark.
     assert watermark == "2024-01-01 11:00:00.000000"
 
 
 def test_batch_bounds_without_timestamps_has_no_watermark(spark) -> None:
     batch = spark.createDataFrame(
-        [(0, 100, None), (1, 200, "nao-e-data")],
+        [(0, 100, None), (1, 200, "not-a-date")],
         "kafka_partition int, kafka_offset long, event_time string",
     )
 

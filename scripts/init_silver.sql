@@ -1,21 +1,21 @@
--- DDL do schema Silver (Postgres 5434, banco streaming).
--- Idempotente: `make silver` pode rodar quantas vezes quiser, não apaga dado.
--- ATENÇÃO: `IF NOT EXISTS` NÃO altera tabela existente. Mudança de coluna é `make silver-reset`;
--- depois do restart test o schema é congelado (o teste depende do dado).
+-- DDL of the Silver schema (Postgres 5434, database streaming).
+-- Idempotent: `make silver` can run as many times as needed and never deletes data.
+-- ATTENTION: `IF NOT EXISTS` does NOT alter an existing table. A column change is `make silver-reset`;
+-- after the restart test the schema is frozen (the test depends on the data).
 --
--- Dois tipos de tempo, de propósito (ver docs/notes.md):
---   * event_time / pickup_at / dropoff_at  -> TIMESTAMP (naive, hora local de NY como o TLC publica)
---   * emit_time / ingested_at / updated_at -> TIMESTAMPTZ (instante de parede do producer/consumer)
--- lag_seconds = ingested_at - emit_time (latência do pipeline), nunca ingested_at - event_time
--- (este último daria ~2 anos, porque o replay usa dados de 2024).
+-- Two kinds of time, on purpose (see docs/notes.md):
+--   * event_time / pickup_at / dropoff_at  -> TIMESTAMP (naive, New York local time as TLC publishes)
+--   * emit_time / ingested_at / updated_at -> TIMESTAMPTZ (wall-clock instant of producer/consumer)
+-- lag_seconds = ingested_at - emit_time (pipeline latency), never ingested_at - event_time
+-- (the latter would give ~2 years, because the replay uses 2024 data).
 --
--- Tudo em uma transação: se algo falhar no meio, não fica schema pela metade.
+-- Everything in one transaction: if something fails halfway, no half-built schema is left behind.
 BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS silver;
 
--- 1 linha por trip_id. A PK é onde a dedup de verdade acontece.
--- Linha inválida ENTRA aqui com is_valid_trip = false (política do Silver, ver docs/notes.md).
+-- 1 row per trip_id. The PK is where the real dedup happens.
+-- An invalid row ENTERS here with is_valid_trip = false (Silver policy, see docs/notes.md).
 CREATE TABLE IF NOT EXISTS silver.trip_events (
     trip_id          TEXT PRIMARY KEY,
     pickup_at        TIMESTAMP      NOT NULL,
@@ -33,13 +33,13 @@ CREATE TABLE IF NOT EXISTS silver.trip_events (
     lag_seconds      DOUBLE PRECISION
 );
 
--- Consultas de reconciliação ponta a ponta e da janela por zona varrem por pickup_at.
+-- End-to-end reconciliation and the zone window both scan by pickup_at.
 CREATE INDEX IF NOT EXISTS trip_events_pickup_at_idx
     ON silver.trip_events (pickup_at);
 CREATE INDEX IF NOT EXISTS trip_events_zone_pickup_idx
     ON silver.trip_events (pickup_zone_id, pickup_at);
 
--- Zona x janela tumbling de 5 min. PK composta = chave do upsert da janela.
+-- Zone x 5-minute tumbling window. Composite PK = the window upsert key.
 CREATE TABLE IF NOT EXISTS silver.zone_demand_5min (
     pickup_zone_id   INTEGER       NOT NULL,
     window_start     TIMESTAMP     NOT NULL,
@@ -52,21 +52,21 @@ CREATE TABLE IF NOT EXISTS silver.zone_demand_5min (
     CONSTRAINT zone_demand_5min_window_5min CHECK (window_end = window_start + interval '5 minutes')
 );
 
--- Uma linha só: watermark = max(event_time) do lote anterior, base do filtro de atraso próprio.
--- watermark NULL = "primeiro lote, aceita tudo" (NÃO é "descarta tudo").
+-- Single row: watermark = the previous batch's watermark, the base of the late filter.
+-- A NULL watermark means "first batch, accept everything" (NOT "discard everything").
 CREATE TABLE IF NOT EXISTS silver.stream_state (
     id         SMALLINT    PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     watermark  TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Semeia a linha única para o job poder sempre fazer UPDATE ... WHERE id = 1.
+-- Seed the single row so the job can always run UPDATE ... WHERE id = 1.
 INSERT INTO silver.stream_state (id) VALUES (1)
 ON CONFLICT (id) DO NOTHING;
 
--- Livro-caixa dos micro-lotes. A PK é a identidade do lote (faixas de offset por partição), que se
--- repete quando o checkpoint reexecuta o lote: o INSERT ... ON CONFLICT DO NOTHING faz a repetição
--- não somar duas vezes. `data/state/counters.json` é a soma desta tabela, não do processo.
+-- Micro-batch ledger. The PK is the batch identity (offset ranges per partition), which repeats when
+-- the checkpoint re-executes the batch: the INSERT ... ON CONFLICT DO NOTHING keeps the repetition
+-- from counting twice. `data/state/counters.json` is the sum of this table, not of the process.
 CREATE TABLE IF NOT EXISTS silver.batch_runs (
     batch_key          TEXT PRIMARY KEY,
     consumed           INTEGER     NOT NULL,

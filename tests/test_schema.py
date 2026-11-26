@@ -1,4 +1,4 @@
-"""Contrato do evento `trips.raw`: campos, serialização, `trip_id` e injeção de sujos."""
+"""`trips.raw` event contract: fields, serialization, `trip_id` and dirty-event injection."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ EMIT = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
 
 
 def row(**overrides: Any) -> dict[str, Any]:
-    """Linha do Parquet com o mínimo que o produtor lê (nomes originais do TLC)."""
+    """Parquet row with the minimum the producer reads (original TLC names)."""
     base: dict[str, Any] = {
         "tpep_pickup_datetime": datetime(2024, 1, 1, 0, 12, 0),
         "tpep_dropoff_datetime": datetime(2024, 1, 1, 0, 27, 0),
@@ -41,7 +41,7 @@ def row(**overrides: Any) -> dict[str, Any]:
 
 
 def test_event_fields_in_order() -> None:
-    """O dict do evento segue `EVENT_FIELDS` — o teste que fecha o contrato do tópico."""
+    """The event dict follows `EVENT_FIELDS` — the test that closes the topic contract."""
     assert tuple(build_event(row(), EMIT)) == EVENT_FIELDS
 
 
@@ -87,7 +87,7 @@ def test_trip_id_is_deterministic_and_sensitive() -> None:
 
 
 def test_trip_id_golden() -> None:
-    """Regressão: mudar a fórmula trocaria todos os ids e quebraria a idempotência entre versões."""
+    """Regression: changing the formula would swap every id and break idempotency across versions."""
     assert make_trip_id(
         "2024-01-01T00:12:00", "2024-01-01T00:27:00", 114, 48, 17.3
     ) == "bc7cdc0e1cdc29bd"
@@ -111,17 +111,17 @@ def test_dirty_events_cover_every_reason_and_stay_unique() -> None:
     base = build_event(row(), EMIT)
     dirty = [build_dirty_event(base, seq, EMIT) for seq in range(len(DIRTY_KINDS))]
 
-    # contrato do tópico preservado (mesmos campos, mesma ordem, JSON válido)
+    # topic contract preserved (same fields, same order, valid JSON)
     for event in dirty:
         assert tuple(event) == EVENT_FIELDS
         json.loads(dumps(event))
 
-    # um `trip_id` por evento: sujo não pode virar "duplicata" no Silver
+    # one `trip_id` per event: a dirty event cannot become a "duplicate" in the Silver
     ids = [event["trip_id"] for event in dirty]
     assert len(set(ids)) == len(ids)
     assert set(ids).isdisjoint({base["trip_id"]})
 
-    # e cada um viola exatamente a regra que o nome promete
+    # and each one violates exactly the rule its name promises
     by_kind = dict(zip(DIRTY_KINDS, dirty, strict=True))
     assert by_kind["pickup_zone_null"]["pickup_zone_id"] is None
     zero = by_kind["non_positive_duration"]
@@ -133,7 +133,7 @@ def test_dirty_events_cover_every_reason_and_stay_unique() -> None:
 def test_dirty_shift_stays_unique_across_the_dirty_kinds_cycle() -> None:
     base = build_event(row(), EMIT)
     first = build_dirty_event(base, 0, EMIT)  # pickup_zone_null
-    fifth = build_dirty_event(base, 4, EMIT)  # mesmo motivo, outra sequência
+    fifth = build_dirty_event(base, 4, EMIT)  # same reason, another sequence
 
     assert first["trip_id"] != fifth["trip_id"]
     assert datetime.fromisoformat(fifth["event_time"]) - datetime.fromisoformat(
@@ -147,5 +147,5 @@ def test_dirty_handles_null_dropoff_without_mutating_base() -> None:
 
     zero_duration = build_dirty_event(base, 1, EMIT)  # non_positive_duration
     assert zero_duration["dropoff_at"] == zero_duration["event_time"]
-    assert build_dirty_event(base, 0, EMIT)["dropoff_at"] is None  # preserva o nulo
+    assert build_dirty_event(base, 0, EMIT)["dropoff_at"] is None  # keeps the null
     assert base == snapshot

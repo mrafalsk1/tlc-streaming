@@ -1,33 +1,34 @@
-"""Spark lê `trips.raw` e grava Bronze (Parquet) e Silver (Postgres) no mesmo micro-lote.
+"""Spark reads `trips.raw` and writes Bronze (Parquet) and Silver (Postgres) in the same micro-batch.
 
-O Bronze é append-only e **cru**: válidos, inválidos e atrasados entram todos. Limpeza e dedup são
-do Silver — este job só transporta o que chegou. Consequência assumida: se ele morrer entre a
-escrita do Parquet e o commit do checkpoint, o micro-lote é reescrito e o Bronze ganha linhas
-repetidas por `(kafka_partition, kafka_offset)`. Não é bug, é o retrato do at-least-once; o restart
-test mede isso.
+Bronze is append-only and **raw**: valid, invalid and late events all land there. Cleanup and dedup
+belong to the Silver — this job only carries what arrived. Assumed consequence: if it dies between
+the Parquet write and the checkpoint commit, the micro-batch is written again and Bronze gets rows
+repeated by `(kafka_partition, kafka_offset)`. Not a bug, it is the at-least-once picture; the
+restart test measures it.
 
-O ramo Silver roda no mesmo `foreachBatch`, depois do Parquet: valida, filtra atraso pelo
-`silver.stream_state` e faz upsert no Postgres (ver `streaming.silver`). Um lote, duas camadas, os
-mesmos offsets — o que o Bronze guardou é exatamente o que o Silver julgou.
+The Silver branch runs in the same `foreachBatch`, after the Parquet: it validates, filters late
+data through `silver.stream_state` and upserts into Postgres (see `streaming.silver`). One batch, two
+layers, the same offsets — what Bronze stored is exactly what the Silver judged.
 
-Três decisões que não são óbvias:
+Three decisions that are not obvious:
 
-* **`kafka.group.id` fixo** (`spark-tlc-stream`): sem ele o Spark gera um id aleatório por execução e
-  o `rpk group describe` não acha o grupo — não dá para falar de lag de consumidor.
-* **Offset vem do checkpoint**, não do grupo: `startingOffsets=earliest` só vale na primeira
-  execução (checkpoint novo). Parar e subir de novo continua de onde parou, sem reprocessar do zero.
-* **Partição por `ingest_date`/`hour` em UTC**: `ingested_at` é o instante da escrita; derivar a
-  partição no fuso da sessão faria o mesmo evento cair em pasta diferente conforme o `TZ` da
-  máquina. Por isso a sessão roda em **UTC** e `add_ingest_columns` recusa qualquer outro fuso, em
-  vez de gravar a partição errada em silêncio. O mesmo UTC serve ao Silver: o `event_time` chega
-  como texto naive de NY e o `to_timestamp` mantém o relógio de parede (não desloca), enquanto
-  `emit_time`/`ingested_at` viram instantes corretos.
+* **Fixed `kafka.group.id`** (`spark-tlc-stream`): without it Spark generates a random id per run and
+  `rpk group describe` cannot find the group — there is no way to talk about consumer lag.
+* **Offsets come from the checkpoint**, not from the group: `startingOffsets=earliest` only applies on
+  the first run (new checkpoint). Stopping and starting again continues from where it stopped, without
+  reprocessing from the beginning.
+* **Partition by `ingest_date`/`hour` in UTC**: `ingested_at` is the write instant; deriving the
+  partition in the session timezone would put the same event in a different folder depending on the
+  machine `TZ`. That is why the session runs in **UTC** and `add_ingest_columns` refuses any other
+  timezone instead of silently writing the wrong partition. The same UTC serves the Silver: the
+  `event_time` arrives as New York naive text and `to_timestamp` keeps the wall clock (it does not
+  shift), while `emit_time`/`ingested_at` become the correct instants.
 
-Uso (o Makefile já exporta o `JAVA_HOME` do JDK 21):
+Usage (the Makefile already exports the JDK 21 `JAVA_HOME`):
 
-    make jars     # uma vez, com rede: baixa o conector e copia para jars/
-    make stream   # roda até Ctrl+C
-    make stream STREAM_ARGS="--available-now"   # drena o que existe e encerra
+    make jars     # once, with network: downloads the connector and copies it to jars/
+    make stream   # runs until Ctrl+C
+    make stream STREAM_ARGS="--available-now"   # drains what exists and exits
 """
 
 from __future__ import annotations
@@ -43,13 +44,13 @@ from streaming import silver
 from streaming.schema import EVENT_SCHEMA
 
 DEFAULT_GROUP_ID = "spark-tlc-stream"
-# O Bronze guarda `event_time`/`dropoff_at` como texto (fidelidade do cru), então o job não precisa
-# interpretar o horário de NY; a sessão fica em UTC para as partições serem estáveis.
+# Bronze stores `event_time`/`dropoff_at` as text (raw fidelity), so the job does not need to
+# interpret the New York clock; the session stays in UTC so the partitions are stable.
 SESSION_TIMEZONE = "UTC"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Consome trips.raw e grava Bronze + Silver.")
+    parser = argparse.ArgumentParser(description="Consume trips.raw and write Bronze + Silver.")
     parser.add_argument("--bootstrap-servers", default="localhost:9092")
     parser.add_argument("--topic", default="trips.raw")
     parser.add_argument("--bronze-dir", default="data/bronze")
@@ -59,33 +60,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--master", default="local[2]")
     parser.add_argument("--max-offsets-per-trigger", type=int, default=50_000)
     parser.add_argument("--trigger", default="10 seconds")
-    parser.add_argument("--dsn", default=silver.DEFAULT_DSN, help="DSN do Postgres do Silver")
+    parser.add_argument("--dsn", default=silver.DEFAULT_DSN, help="Postgres DSN for the Silver")
     parser.add_argument(
         "--counters",
         default=silver.DEFAULT_COUNTERS_PATH,
-        help="contadores incrementais do Silver",
+        help="incremental Silver counters",
     )
     parser.add_argument(
         "--bronze-only",
         action="store_true",
-        help="grava só o Bronze (depuração; o pipeline normal inclui o Silver)",
+        help="write only Bronze (debug; the normal pipeline includes the Silver)",
     )
     parser.add_argument(
         "--available-now",
         action="store_true",
-        help="processa o que já existe no tópico (todos os lotes) e encerra",
+        help="process what already exists in the topic (all batches) and exit",
     )
     args = parser.parse_args(argv)
     if args.max_offsets_per_trigger <= 0:
         parser.error(
-            "--max-offsets-per-trigger deve ser positivo: o Silver coleta o lote no driver, "
-            "e um teto ilimitado vira OOM (0 = sem teto no Spark)"
+            "--max-offsets-per-trigger must be positive: the Silver collects the batch on the "
+            "driver, and an unlimited cap turns into OOM (0 = no cap in Spark)"
         )
     return args
 
 
 def jar_list(jars_dir: Path) -> list[str]:
-    """Jars do conector já baixados; lista vazia significa que `make jars` ainda não rodou."""
+    """Connector jars already downloaded; an empty list means `make jars` has not run yet."""
     return [str(path) for path in sorted(jars_dir.glob("*.jar"))]
 
 
@@ -93,10 +94,11 @@ def build_session(args: argparse.Namespace, jars: list[str]) -> SparkSession:
     builder = (
         SparkSession.builder.master(args.master)
         .appName("tlc-stream")
-        # `ingest_date`/`hour` saem das funções de data do Spark, que usam o fuso da sessão.
-        # UTC aqui é o que torna a partição independente do `TZ` da máquina (ver add_ingest_columns).
+        # `ingest_date`/`hour` come from Spark date functions, which use the session timezone.
+        # UTC here is what makes the partition independent of the machine `TZ` (see
+        # add_ingest_columns).
         .config("spark.sql.session.timeZone", SESSION_TIMEZONE)
-        # Lab de 1 nó: o default (200) só cria tarefas vazias e polui o log.
+        # Single-node lab: the default (200) only creates empty tasks and pollutes the log.
         .config("spark.sql.shuffle.partitions", "4")
     )
     if jars:
@@ -105,11 +107,11 @@ def build_session(args: argparse.Namespace, jars: list[str]) -> SparkSession:
 
 
 def parse_events(df: DataFrame) -> DataFrame:
-    """JSON do tópico → colunas do evento + posição no Kafka.
+    """Topic JSON → event columns + Kafka position.
 
-    `PERMISSIVE` (default) devolve nulos para linha corrompida em vez de derrubar o job: o Bronze é
-    cru e o `trip_id` nulo é justamente uma das regras de invalidez do Silver (lá ele vira
-    `rejected`, porque não há PK para receber nulo).
+    `PERMISSIVE` (default) returns nulls for a corrupt line instead of killing the job: Bronze is
+    raw and a null `trip_id` is exactly one of the Silver invalidity rules (there it becomes
+    `rejected`, because there is no PK to receive a null).
     """
     parsed = df.select(
         F.from_json(F.col("value").cast("string"), EVENT_SCHEMA).alias("event"),
@@ -120,16 +122,17 @@ def parse_events(df: DataFrame) -> DataFrame:
 
 
 def add_ingest_columns(df: DataFrame) -> DataFrame:
-    """Acrescenta `ingested_at` e as partições `ingest_date`/`hour`, derivadas em UTC.
+    """Add `ingested_at` and the `ingest_date`/`hour` partitions, derived in UTC.
 
-    `to_date`/`hour` leem o timestamp no fuso da sessão; por isso a sessão do job é fixada em UTC e
-    a função **recusa** outro fuso em vez de gravar a partição errada sem avisar.
+    `to_date`/`hour` read the timestamp in the session timezone; that is why the job session is
+    fixed to UTC and the function **refuses** any other timezone instead of writing the wrong
+    partition without warning.
     """
     session_tz = df.sparkSession.conf.get("spark.sql.session.timeZone")
     if session_tz != SESSION_TIMEZONE:
         raise ValueError(
-            f"fuso da sessão é {session_tz!r}, esperado {SESSION_TIMEZONE!r}: "
-            "as partições ingest_date/hour sairiam tortas"
+            f"session timezone is {session_tz!r}, expected {SESSION_TIMEZONE!r}: "
+            "the ingest_date/hour partitions would come out wrong"
         )
     ingested_at = F.current_timestamp()
     return df.select(
@@ -146,11 +149,11 @@ def build_stream(spark: SparkSession, args: argparse.Namespace) -> DataFrame:
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
         .option("subscribe", args.topic)
         .option("kafka.group.id", args.group_id)
-        # Grupo fixo + `kill -9` no restart test: sem isto o coordenador espera os 45 s default do
-        # Kafka para declarar o consumidor morto e o restart parece travado. Heartbeat default
-        # (3 s) continua abaixo do mínimo de 3× exigido pelo broker.
+        # Fixed group + `kill -9` in the restart test: without this the coordinator waits the 45 s
+        # Kafka default to declare the consumer dead and the restart looks stuck. The default
+        # heartbeat (3 s) stays below the 3× minimum required by the broker.
         .option("kafka.session.timeout.ms", "10000")
-        # Só tem efeito na primeira execução (checkpoint novo); depois manda o checkpoint.
+        # Only effective on the first run (new checkpoint); afterwards the checkpoint decides.
         .option("startingOffsets", "earliest")
         .option("maxOffsetsPerTrigger", str(args.max_offsets_per_trigger))
         .load()
@@ -167,7 +170,7 @@ def handle_batch(
     counters_path: str,
     bronze_only: bool = False,
 ) -> None:
-    """Destino do `foreachBatch`: Bronze primeiro (cru), depois o ramo Silver."""
+    """`foreachBatch` target: Bronze first (raw), then the Silver branch."""
     batch.persist()
     try:
         (
@@ -180,10 +183,10 @@ def handle_batch(
             return
         result = silver.process_batch(batch, batch_id, dsn=dsn, counters_path=counters_path)
         print(
-            f"lote {batch_id}: consumidos={result.consumed} "
-            f"validos={result.valid_stored} invalidos={result.invalid} "
-            f"atrasados={result.late_dropped} duplicados={result.duplicates_dropped} "
-            f"rejeitados={result.rejected}",
+            f"batch {batch_id}: consumed={result.consumed} "
+            f"valid={result.valid_stored} invalid={result.invalid} "
+            f"late={result.late_dropped} duplicates={result.duplicates_dropped} "
+            f"rejected={result.rejected}",
             flush=True,
         )
     finally:
@@ -194,15 +197,15 @@ def run(args: argparse.Namespace) -> int:
     jars = jar_list(Path(args.jars_dir))
     if not jars:
         print(
-            f"nenhum jar em {args.jars_dir}/ — rode 'make jars' uma vez (precisa de rede)",
+            f"no jars in {args.jars_dir}/ — run 'make jars' once (needs network)",
             flush=True,
         )
         return 2
 
     spark = build_session(args, jars)
     print(
-        f"spark {spark.version} | {args.master} | grupo {args.group_id} | "
-        f"lote máx {args.max_offsets_per_trigger} | fuso {SESSION_TIMEZONE}",
+        f"spark {spark.version} | {args.master} | group {args.group_id} | "
+        f"max batch {args.max_offsets_per_trigger} | tz {SESSION_TIMEZONE}",
         flush=True,
     )
 
@@ -224,7 +227,7 @@ def run(args: argparse.Namespace) -> int:
         writer = writer.trigger(processingTime=args.trigger)
 
     print(
-        f"bronze em {args.bronze_dir} | checkpoint {args.checkpoint_dir} | "
+        f"bronze at {args.bronze_dir} | checkpoint {args.checkpoint_dir} | "
         f"silver {'off (--bronze-only)' if args.bronze_only else 'on'}",
         flush=True,
     )
@@ -232,7 +235,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         query.awaitTermination()
     except KeyboardInterrupt:
-        print("Ctrl+C — encerrando a query e liberando o checkpoint", flush=True)
+        print("Ctrl+C — stopping the query and releasing the checkpoint", flush=True)
         query.stop()
     finally:
         spark.stop()

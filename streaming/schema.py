@@ -1,13 +1,14 @@
-"""Schema explícito do evento consumido de `trips.raw`.
+"""Explicit schema of the event consumed from `trips.raw`.
 
-O tópico carrega JSON sem Schema Registry (Avro ficou fora do escopo), então o produtor é a
-definição do contrato e este arquivo é a única outra ponta: nada de `inferSchema`, que numa amostra
-pequena decide tipo errado e transforma `pickup_zone_id` em `string` só porque um lote veio nulo.
+The topic carries JSON without a Schema Registry (Avro was left out of scope), so the producer is the
+contract definition and this file is the only other end: no `inferSchema`, which on a small sample
+picks the wrong type and turns `pickup_zone_id` into `string` just because one batch came out null.
 
-Os nomes vêm de `producer.schema.EVENT_FIELDS` justamente para as duas pontas não divergirem em
-silêncio (há teste amarrando a ordem). Os dois tempos ficam **texto** no Bronze de propósito: é a
-camada crua, e converter "2024-01-01T00:12:00" (naive, hora local de NY) em timestamp já escolheria
-um fuso no ingest. Quem interpreta o relógio é o Silver, com o fuso fixado no job.
+The names come from `producer.schema.EVENT_FIELDS` exactly so the two ends cannot diverge silently
+(a test pins the order). Both timestamps stay **text** in Bronze on purpose: it is the raw layer, and
+converting "2024-01-01T00:12:00" (naive, New York local time) into a timestamp would already pick a
+timezone at ingest. The side that interprets the clock is the Silver, with the timezone fixed in the
+job.
 """
 
 from __future__ import annotations
@@ -40,12 +41,12 @@ EVENT_SCHEMA = StructType(
 
 if tuple(field.name for field in EVENT_SCHEMA.fields) != EVENT_FIELDS:
     raise RuntimeError(
-        "EVENT_SCHEMA divergiu do contrato do produtor: "
+        "EVENT_SCHEMA diverged from the producer contract: "
         f"{tuple(f.name for f in EVENT_SCHEMA.fields)} != {EVENT_FIELDS}"
     )
 
-# Colunas que o Bronze acrescenta ao evento, na ordem em que saem no Parquet. `ingest_date`/`hour`
-# são colunas de partição derivadas em UTC (ver `streaming.job.add_ingest_columns`).
+# Columns Bronze adds to the event, in the order they come out in the Parquet. `ingest_date`/`hour`
+# are partition columns derived in UTC (see `streaming.job.add_ingest_columns`).
 BRONZE_COLUMNS: tuple[str, ...] = EVENT_FIELDS + (
     "kafka_partition",
     "kafka_offset",

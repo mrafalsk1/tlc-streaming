@@ -1,15 +1,15 @@
-"""Schema explícito do evento `trips.raw` e geração determinística do `trip_id`.
+"""Explicit `trips.raw` event schema and deterministic `trip_id` generation.
 
-O dataset do TLC não tem id de corrida, então o id é derivado do conteúdo do evento
-(`sha1(pickup|dropoff|pu_zone|do_zone|total)[:16]`): reexecutar o replay gera os mesmos ids, que é o
-que permite provar a idempotência do Silver.
+The TLC dataset has no trip id, so the id is derived from the event content
+(`sha1(pickup|dropoff|pu_zone|do_zone|total)[:16]`): replaying again produces the same ids, which is
+what makes the Silver idempotency provable.
 
-Dois tempos, de propósito (ver `docs/notes.md`):
+Two timestamps, on purpose (see `docs/notes.md`):
 
-* ``event_time`` — pickup em hora local de NY (o TLC publica timestamp naive); dirige janela e
-  watermark. É o `pickup_at` do dataset; o job do Silver deriva `pickup_at` dele em vez de repetir a
-  mesma coluna no JSON.
-* ``emit_time`` — relógio de parede em UTC no momento do envio; base de `lag_seconds`.
+* ``event_time`` — pickup in New York local time (the TLC publishes a naive timestamp); drives the
+  window and the watermark. It is the `pickup_at` of the dataset; the Silver job derives
+  `pickup_at` from it instead of repeating the same column in the JSON.
+* ``emit_time`` — wall clock in UTC at send time; the base of `lag_seconds`.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
-# Campos do evento, na ordem em que saem no JSON (documental: é o contrato do tópico).
+# Event fields, in the order they appear in the JSON (the topic contract, as documentation).
 EVENT_FIELDS: tuple[str, ...] = (
     "trip_id",
     "event_time",
@@ -36,8 +36,8 @@ EVENT_FIELDS: tuple[str, ...] = (
     "emit_time",
 )
 
-# Colunas lidas do Parquet. O evento é enxuto de propósito: Bronze guarda o evento do stream, não um
-# espelho do Parquet (extra, mta_tax, congestion_surcharge etc. ficam de fora).
+# Columns read from the Parquet. The event is deliberately lean: Bronze stores the stream event, not
+# a mirror of the Parquet (extra, mta_tax, congestion_surcharge etc. are left out).
 SOURCE_COLUMNS: tuple[str, ...] = (
     "tpep_pickup_datetime",
     "tpep_dropoff_datetime",
@@ -52,14 +52,14 @@ SOURCE_COLUMNS: tuple[str, ...] = (
 
 
 def format_naive(value: datetime | None) -> str | None:
-    """Timestamp de negócio (naive, hora local de NY) em ISO 8601, com segundos."""
+    """Business timestamp (naive, New York local time) in ISO 8601, with seconds."""
     if value is None:
         return None
     return value.isoformat(timespec="seconds")
 
 
 def as_number(value: Any) -> float | int | None:
-    """Converte NaN/Inf em ``None``: JSON não tem esses valores (Jackson do Spark recusaria)."""
+    """Turn NaN/Inf into ``None``: JSON has no such values (Spark's Jackson would reject them)."""
     if value is None:
         return None
     if isinstance(value, float) and not math.isfinite(value):
@@ -68,7 +68,7 @@ def as_number(value: Any) -> float | int | None:
 
 
 def as_zone(value: Any) -> int | None:
-    """Zona TLC (`PULocationID`/`DOLocationID`): inteiro ou ``None`` (o Parquet usa NaN)."""
+    """TLC zone (`PULocationID`/`DOLocationID`): integer or ``None`` (the Parquet uses NaN)."""
     if value is None:
         return None
     if isinstance(value, float):
@@ -85,7 +85,7 @@ def make_trip_id(
     dropoff_zone_id: int | None,
     total_amount: float | None,
 ) -> str:
-    """``sha1`` dos cinco campos identitários, em texto estável (mesmo input ⇒ mesmo id)."""
+    """``sha1`` of the five identity fields, as stable text (same input ⇒ same id)."""
     parts = (
         event_time,
         dropoff_at or "",
@@ -97,14 +97,15 @@ def make_trip_id(
 
 
 def build_event(row: Mapping[str, Any], emit_time: datetime) -> dict[str, Any]:
-    """Converte uma linha do Parquet no evento do tópico.
+    """Convert a Parquet row into the topic event.
 
-    ``row`` usa os nomes originais do TLC. Levanta ``ValueError`` quando não há pickup: sem
-    ``event_time`` a linha não tem ordem nem janela, então não entra no stream (o produtor conta).
+    ``row`` uses the original TLC names. Raises ``ValueError`` when there is no pickup: without
+    ``event_time`` the row has no order and no window, so it does not enter the stream (the producer
+    counts it).
     """
     event_time = format_naive(row.get("tpep_pickup_datetime"))
     if event_time is None:
-        raise ValueError("tpep_pickup_datetime ausente")
+        raise ValueError("tpep_pickup_datetime is missing")
 
     dropoff_at = format_naive(row.get("tpep_dropoff_datetime"))
     pickup_zone_id = as_zone(row.get("PULocationID"))
@@ -133,18 +134,19 @@ def build_event(row: Mapping[str, Any], emit_time: datetime) -> dict[str, Any]:
 
 
 def partition_key(event: Mapping[str, Any]) -> bytes:
-    """Chave da mensagem = zona de embarque; zona nula vira ``unknown`` (nunca key nula)."""
+    """Message key = pickup zone; a null zone becomes ``unknown`` (never a null key)."""
     zone = event["pickup_zone_id"]
     return b"unknown" if zone is None else str(zone).encode("ascii")
 
 
 def dumps(event: Mapping[str, Any]) -> bytes:
-    """Serialização compacta (sem espaços) do evento."""
+    """Compact serialization (no spaces) of the event."""
     return json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-# Motivos de invalidez que o Silver vai recusar (ver docs/notes.md, decisões de modelagem). `trip_id`
-# nulo não entra aqui: o produtor sempre gera um id — esse caso só existe se a deserialização falhar.
+# Invalidity reasons the Silver will refuse (see docs/notes.md, modeling decisions). A null
+# `trip_id` is not listed: the producer always generates an id — that case only exists if
+# deserialization fails.
 DIRTY_KINDS: tuple[str, ...] = (
     "pickup_zone_null",
     "non_positive_duration",
@@ -152,19 +154,19 @@ DIRTY_KINDS: tuple[str, ...] = (
     "fare_over_ceiling",
 )
 
-# Teto de sanidade da tarifa (política do Silver). Acima disso o evento nasce inválido.
+# Fare sanity ceiling (Silver policy). Above this the event is born invalid.
 FARE_CEILING = 10_000.0
 
 
 def build_dirty_event(
     base: Mapping[str, Any], seq: int, emit_time: datetime
 ) -> dict[str, Any]:
-    """Evento sintético que o Silver deve marcar como ``is_valid_trip = false``.
+    """Synthetic event the Silver must mark as ``is_valid_trip = false``.
 
-    Derivado do último evento real, com ``event_time`` deslocado ``seq + 1`` segundos: o
-    ``trip_id`` sai único (não vira duplicata) e o evento continua próximo do ponto do stream, sem
-    cair no filtro de atraso. O motivo cicla por ``DIRTY_KINDS``, então uma injeção de 4 já cobre
-    todas as regras de invalidez.
+    Derived from the last real event, with ``event_time`` shifted ``seq + 1`` seconds: the
+    ``trip_id`` comes out unique (it does not become a duplicate) and the event stays close to the
+    stream position, without falling into the late filter. The reason cycles through
+    ``DIRTY_KINDS``, so an injection of 4 already covers every invalidity rule.
     """
     kind = DIRTY_KINDS[seq % len(DIRTY_KINDS)]
     shift = timedelta(seconds=seq + 1)

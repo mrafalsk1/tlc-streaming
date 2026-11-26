@@ -1,14 +1,14 @@
-"""Replay dos Parquet do TLC para o tópico ``trips.raw``.
+"""Replay of the TLC Parquet files into the ``trips.raw`` topic.
 
     uv run python producer/producer.py --rate 500 --limit 20000
 
-Cada arquivo é de um mês; ordenar por pickup dentro do arquivo e concatenar jan→mar dá a ordem
-cronológica global (é o que impede quase todo evento de nascer "atrasado"). Key = zona de embarque,
-``acks=all`` + idempotência (o replay precisa ser reprodutível: mesmos eventos, mesmos ``trip_id``).
+Each file is one month; sorting by pickup inside the file and concatenating Jan→Mar gives the global
+chronological order (which is what keeps almost every event from being born "late"). Key = pickup
+zone, ``acks=all`` + idempotence (the replay must be reproducible: same events, same ``trip_id``).
 
-``--rate 0`` desliga o freio e ``--limit 0`` replaya os arquivos inteiros. ``--dupes N`` reenvia
-N eventos (mesmo payload, mesmo ``trip_id``) e ``--dirty N`` injeta N eventos inválidos com id único
-— as duas flags existem para o Silver provar dedup e validação de verdade.
+``--rate 0`` disables the throttle and ``--limit 0`` replays the whole files. ``--dupes N`` resends
+N events (same payload, same ``trip_id``) and ``--dirty N`` injects N invalid events with a unique
+id — both flags exist so the Silver can prove dedup and validation for real.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from confluent_kafka import Producer
 
-if __package__ in (None, ""):  # executado como script: sys.path não inclui a raiz do repo
+if __package__ in (None, ""):  # run as a script: sys.path does not include the repo root
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from producer.schema import (
@@ -42,66 +42,67 @@ DEFAULT_RAW_DIR = Path(os.environ.get("TLC_RAW_DIR", "~/projetos/tlc-elt/data/ra
 DEFAULT_BROKERS = os.environ.get("KAFKA_BROKERS", "localhost:9092")
 CHUNK_ROWS = 10_000
 MESSAGE_TIMEOUT_MS = 30_000
-# O flush espera mais que o timeout da mensagem, senão ele desiste antes de os callbacks de erro
-# chegarem e o processo sairia com "0 falhas" depois de perder mensagem em silêncio.
+# The flush waits longer than the message timeout, otherwise it gives up before the error callbacks
+# arrive and the process would exit with "0 failures" after losing a message silently.
 FLUSH_TIMEOUT_S = 45.0
 MAX_ERROR_SAMPLES = 5
-# Broker que não recebe: insistir só repete o timeout. 100 falhas já é sinal de que algo está errado.
+# A broker that is not receiving: insisting only repeats the timeout. 100 failures already mean
+# something is wrong.
 ABORT_AFTER_FAILURES = 100
-# O `--dirty` desloca o `event_time` até `N` segundos à frente do ponto do stream. O filtro de atraso
-# do Silver usa 10 min; 5 min de folga impedem que o sujo empurre o max e faça os reais seguintes
-# parecerem atrasados (o oposto do objetivo da injeção).
+# `--dirty` shifts `event_time` up to `N` seconds ahead of the stream position. The Silver late
+# filter uses 10 min; 5 min of headroom keep the dirty event from pushing the max and making the
+# following real events look late (the opposite of the injection goal).
 MAX_DIRTY_AHEAD_S = 300
 
 
 class AbortReplay(RuntimeError):
-    """Falhas de entrega demais: melhor parar do que seguir empilhando timeouts."""
+    """Too many delivery failures: better to stop than to keep stacking timeouts."""
 
 log = logging.getLogger("producer")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Replay do TLC Parquet para o tópico trips.raw.")
-    parser.add_argument("--rate", type=float, default=500.0, help="eventos por segundo (0 = sem freio)")
-    parser.add_argument("--limit", type=int, default=20_000, help="total de eventos (0 = tudo)")
+    parser = argparse.ArgumentParser(description="Replay TLC Parquet into the trips.raw topic.")
+    parser.add_argument("--rate", type=float, default=500.0, help="events per second (0 = no throttle)")
+    parser.add_argument("--limit", type=int, default=20_000, help="total events (0 = all)")
     parser.add_argument(
         "--raw-dir",
         type=Path,
         default=DEFAULT_RAW_DIR,
-        help=f"diretório dos Parquet (default: {DEFAULT_RAW_DIR})",
+        help=f"Parquet directory (default: {DEFAULT_RAW_DIR})",
     )
     parser.add_argument(
         "--files",
         type=Path,
         nargs="+",
-        help="Parquets explícitos, na ordem dada (vence --raw-dir)",
+        help="explicit Parquet files, in the given order (overrides --raw-dir)",
     )
     parser.add_argument("--brokers", default=DEFAULT_BROKERS, help=f"default: {DEFAULT_BROKERS}")
     parser.add_argument("--topic", default="trips.raw")
-    parser.add_argument("--dupes", type=int, default=0, help="duplicatas exatas a injetar")
+    parser.add_argument("--dupes", type=int, default=0, help="exact duplicates to inject")
     parser.add_argument(
         "--dirty",
         type=int,
         default=0,
-        help=f"eventos inválidos a injetar, motivos ciclando em DIRTY_KINDS (máx {MAX_DIRTY_AHEAD_S})",
+        help=f"invalid events to inject, reasons cycling through DIRTY_KINDS (max {MAX_DIRTY_AHEAD_S})",
     )
-    parser.add_argument("--log-every", type=float, default=5.0, help="intervalo do log de ev/s")
+    parser.add_argument("--log-every", type=float, default=5.0, help="ev/s log interval")
     args = parser.parse_args(argv)
     if args.rate < 0:
-        parser.error("--rate não pode ser negativo")
+        parser.error("--rate cannot be negative")
     if args.limit < 0:
-        parser.error("--limit não pode ser negativo")
+        parser.error("--limit cannot be negative")
     if args.dupes < 0:
-        parser.error("--dupes não pode ser negativo")
+        parser.error("--dupes cannot be negative")
     if args.dirty < 0:
-        parser.error("--dirty não pode ser negativo")
+        parser.error("--dirty cannot be negative")
     if args.dirty > MAX_DIRTY_AHEAD_S:
         parser.error(
-            f"--dirty máximo é {MAX_DIRTY_AHEAD_S}: o sujo adia o event_time até N s e o filtro de "
-            "atraso do Silver usa 10 min"
+            f"--dirty maximum is {MAX_DIRTY_AHEAD_S}: the dirty event shifts event_time up to N s "
+            "ahead and the Silver late filter uses 10 min"
         )
     if args.log_every <= 0:
-        parser.error("--log-every deve ser positivo")
+        parser.error("--log-every must be positive")
     return args
 
 
@@ -111,16 +112,16 @@ def resolve_files(args: argparse.Namespace) -> list[Path]:
     else:
         files = sorted(args.raw_dir.glob("yellow_tripdata_*.parquet"))
     if not files:
-        raise SystemExit(f"nenhum Parquet em {args.raw_dir} (use --files ou TLC_RAW_DIR)")
+        raise SystemExit(f"no Parquet in {args.raw_dir} (use --files or TLC_RAW_DIR)")
     return files
 
 
 def iter_rows(path: Path, chunk_rows: int = CHUNK_ROWS) -> Iterator[dict[str, Any]]:
-    """Linhas do arquivo em ordem de ``tpep_pickup_datetime``.
+    """Rows of the file in ``tpep_pickup_datetime`` order.
 
-    Ordena o mês inteiro: só assim a amostra de ``--limit`` sai cronológica. A tabela Arrow fica
-    viva durante a iteração (é o custo aceito); o ``to_pylist`` vai em blocos para não estourar
-    memória com 3 milhões de dicts.
+    Sorts the whole month: only then does the ``--limit`` sample come out chronological. The Arrow
+    table stays alive during the iteration (the accepted cost); ``to_pylist`` runs in blocks so
+    memory does not blow up with 3 million dicts.
     """
     table = pq.read_table(path, columns=list(SOURCE_COLUMNS))
     indices = pc.sort_indices(table, sort_keys=[("tpep_pickup_datetime", "ascending")])
@@ -130,11 +131,11 @@ def iter_rows(path: Path, chunk_rows: int = CHUNK_ROWS) -> Iterator[dict[str, An
 
 
 def pace(started: float, sent: int, rate: float) -> None:
-    """Segura o ritmo em ``rate`` ev/s, dormindo só o que falta (``rate 0`` = sem freio)."""
+    """Hold the pace at ``rate`` ev/s, sleeping only what is missing (``rate 0`` = no throttle)."""
     if rate <= 0:
         return
     delay = started + sent / rate - time.monotonic()
-    if delay > 0.005:  # abaixo disso o sleep custa mais que o benefício
+    if delay > 0.005:  # below this the sleep costs more than it helps
         time.sleep(delay)
 
 
@@ -162,19 +163,19 @@ def run(args: argparse.Namespace) -> int:
                 error_samples.append(f"{msg.topic()}[{msg.partition()}]@{msg.offset()}: {err}")
 
     def send(event: dict[str, Any]) -> None:
-        """Envia sem estourar a fila local; para quando o broker já recusou demais."""
+        """Send without flooding the local queue; stop when the broker has refused too many."""
         key = partition_key(event)
         payload = dumps(event)
         while True:
             if delivery_failures >= ABORT_AFTER_FAILURES:
                 raise AbortReplay(
-                    f"{delivery_failures} falhas de entrega: o broker não está recebendo"
+                    f"{delivery_failures} delivery failures: the broker is not receiving"
                 )
             try:
                 producer.produce(args.topic, key=key, value=payload, on_delivery=on_delivery)
                 return
             except BufferError:
-                # fila local cheia: serve callbacks para liberar espaço e tenta de novo
+                # local queue full: serve callbacks to free space and try again
                 producer.poll(0.5)
 
     sent = 0
@@ -193,7 +194,7 @@ def run(args: argparse.Namespace) -> int:
             if args.limit and sent >= args.limit:
                 break
             log.info("replay %s", path.name)
-            # a leitura/ordenação de cada mês não vira crédito de ritmo (rajada na fronteira)
+            # reading/sorting each month does not become pacing credit (a burst at the boundary)
             paced_start = None
             for row in iter_rows(path):
                 if args.limit and sent >= args.limit:
@@ -206,24 +207,25 @@ def run(args: argparse.Namespace) -> int:
                 last_event = event
                 sent += 1
                 window_count += 1
-                # Injeção: duplicata é o mesmo payload de novo; sujo é derivado do evento
-                # atual, com trip_id único e motivo de invalidez ciclando em DIRTY_KINDS.
+                # Injection: a duplicate is the same payload again; a dirty event is derived from
+                # the current event, with a unique trip_id and an invalidity reason cycling through
+                # DIRTY_KINDS.
                 if dupes_sent < args.dupes:
                     send(event)
                     dupes_sent += 1
                 if dirty_sent < args.dirty:
                     send(build_dirty_event(event, dirty_sent, datetime.now(UTC)))
                     dirty_sent += 1
-                producer.poll(0)  # serve os callbacks de entrega (não drena a fila de produção)
+                producer.poll(0)  # serve delivery callbacks (does not drain the produce queue)
                 if paced_start is None:
-                    # âncora depois do primeiro envio: a ordenação do mês não vira burst de crédito
+                    # anchor after the first send: sorting the month does not become burst credit
                     paced_start = time.monotonic()
                 pace(paced_start, sent + dupes_sent + dirty_sent, args.rate)
 
                 now = time.monotonic()
                 if now - window_start >= args.log_every:
                     log.info(
-                        "enviados=%d  %.0f ev/s no total  %.0f ev/s nos ultimos %.0fs",
+                        "sent=%d  %.0f ev/s total  %.0f ev/s in the last %.0fs",
                         sent,
                         sent / (now - started),
                         window_count / (now - window_start),
@@ -231,8 +233,8 @@ def run(args: argparse.Namespace) -> int:
                     )
                     window_start = now
                     window_count = 0
-        # --dupes/--dirty maiores que o stream: o que sobrou sai ancorado no último evento real
-        # (contrato das flags é "injetar N" — o contador do Silver precisa bater com o pedido).
+        # --dupes/--dirty larger than the stream: the remainder goes out anchored on the last real
+        # event (the flag contract is "inject N" — the Silver counter must match the request).
         if last_event is not None:
             while dupes_sent < args.dupes:
                 send(last_event)
@@ -242,7 +244,7 @@ def run(args: argparse.Namespace) -> int:
                 dirty_sent += 1
         elif args.dupes or args.dirty:
             log.warning(
-                "sem evento real para ancorar a injeção: 0 de %d duplicatas e 0 de %d sujos",
+                "no real event to anchor the injection: 0 of %d duplicates and 0 of %d dirty",
                 args.dupes,
                 args.dirty,
             )
@@ -253,16 +255,16 @@ def run(args: argparse.Namespace) -> int:
         pending = producer.flush(FLUSH_TIMEOUT_S)
         if pending and len(error_samples) < MAX_ERROR_SAMPLES:
             error_samples.append(
-                f"{pending} mensagens sem confirmação em {FLUSH_TIMEOUT_S:.0f}s (message.timeout "
+                f"{pending} messages unconfirmed after {FLUSH_TIMEOUT_S:.0f}s (message.timeout "
                 f"{MESSAGE_TIMEOUT_MS}ms)"
             )
 
     elapsed = time.monotonic() - started
     total = sent + dupes_sent + dirty_sent
     log.info(
-        "fim: %d enviados, %d duplicatas, %d sujos, %d ignorados (pickup nulo), "
-        "%d falhas de entrega, %d sem confirmação, em %.1fs = %.0f ev/s reais "
-        "(%.0f ev/s no broker)",
+        "done: %d sent, %d duplicates, %d dirty, %d skipped (null pickup), "
+        "%d delivery failures, %d unconfirmed, in %.1fs = %.0f ev/s real "
+        "(%.0f ev/s at the broker)",
         sent,
         dupes_sent,
         dirty_sent,
@@ -275,10 +277,10 @@ def run(args: argparse.Namespace) -> int:
     )
     if delivery_failures or pending or aborted:
         if error_samples:
-            log.error("primeiras falhas: %s", "; ".join(error_samples))
+            log.error("first failures: %s", "; ".join(error_samples))
         return 1
     if args.limit and sent < args.limit:
-        log.error("limite de %d não alcançado: só %d eventos disponíveis", args.limit, sent)
+        log.error("limit of %d not reached: only %d events available", args.limit, sent)
         return 1
     return 0
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Valida o ambiente: containers de pé, tópico com 6 partições, retenção 24 h, portas respondendo.
+# Validates the environment: containers up, topic with 6 partitions, 24 h retention, ports answering.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -7,11 +7,11 @@ echo "== docker compose ps =="
 docker compose ps
 
 echo
-echo "== tópico =="
+echo "== topic =="
 docker compose exec -T redpanda rpk topic describe trips.raw
 
 echo
-echo "== retenção efetiva =="
+echo "== effective retention =="
 docker compose exec -T redpanda rpk topic describe trips.raw | grep -E '^retention\.ms' || true
 
 echo
@@ -20,4 +20,4 @@ docker compose exec -T postgres psql -U stream -d streaming -c 'select current_d
 
 echo
 echo "== console 8081 =="
-(code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8081/); echo "HTTP $code" || echo "console não respondeu")
+(code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:8081/); echo "HTTP $code" || echo "console did not answer")

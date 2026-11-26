@@ -1,4 +1,4 @@
-"""Testes do replay: ordenação, ritmo (`pace`), flags de injeção e contabilidade do run."""
+"""Replay tests: ordering, pacing (`pace`), injection flags and run accounting."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from producer.schema import EVENT_FIELDS
 
 
 def write_parquet(path: Path, pickups: list[datetime]) -> Path:
-    """Parquet mínimo (colunas do TLC) com uma linha por pickup, na ordem dada."""
+    """Minimal Parquet (TLC columns) with one row per pickup, in the given order."""
     rows = [
         {
             "tpep_pickup_datetime": pickup,
@@ -38,7 +38,7 @@ def write_parquet(path: Path, pickups: list[datetime]) -> Path:
 
 def test_iter_rows_orders_by_pickup(tmp_path: Path) -> None:
     path = write_parquet(
-        tmp_path / "mes.parquet",
+        tmp_path / "month.parquet",
         [
             datetime(2024, 1, 1, 0, 3),
             datetime(2024, 1, 1, 0, 1),
@@ -62,9 +62,9 @@ def test_pace_sleeps_only_the_remaining_time(monkeypatch: pytest.MonkeyPatch) ->
     assert slept == [pytest.approx(0.5)]
 
     slept.clear()
-    replay.pace(started=100.0, sent=3, rate=10.0)  # deadline 100.3: já passou, não dorme
-    replay.pace(started=100.0, sent=10_000, rate=0.0)  # sem freio
-    replay.pace(started=100.0, sent=504, rate=1_000.0)  # falta 4 ms: não dorme
+    replay.pace(started=100.0, sent=3, rate=10.0)  # deadline 100.3: already passed, no sleep
+    replay.pace(started=100.0, sent=10_000, rate=0.0)  # no throttle
+    replay.pace(started=100.0, sent=504, rate=1_000.0)  # 4 ms left: no sleep
     assert slept == []
 
 
@@ -80,7 +80,7 @@ def test_parse_args_caps_dirty_ahead_of_the_late_window() -> None:
 
 
 class FakeProducer:
-    """Substitui o confluent-kafka: registra as mensagens e confirma tudo na hora."""
+    """Replaces confluent-kafka: records the messages and confirms everything right away."""
 
     instances: ClassVar[list[FakeProducer]] = []
 
@@ -101,7 +101,7 @@ class FakeProducer:
 
 
 class FakeMsg:
-    """O callback de erro só usa topic/partition/offset para a amostra."""
+    """The error callback only uses topic/partition/offset for the sample."""
 
     def __init__(self, topic: str) -> None:
         self._topic = topic
@@ -117,11 +117,11 @@ class FakeMsg:
 
 
 class FailingProducer(FakeProducer):
-    """Broker que recusa tudo: exercita o contador de falhas e o exit 1."""
+    """Broker that refuses everything: exercises the failure counter and the exit 1."""
 
     def produce(self, topic: str, key: bytes, value: bytes, on_delivery: Any) -> None:
         self.messages.append((topic, key, value))
-        on_delivery(RuntimeError("broker fora do ar"), FakeMsg(topic))
+        on_delivery(RuntimeError("broker is down"), FakeMsg(topic))
 
 
 def run_replay(monkeypatch: pytest.MonkeyPatch, path: Path, *extra: str) -> int:
@@ -145,7 +145,7 @@ def run_replay(monkeypatch: pytest.MonkeyPatch, path: Path, *extra: str) -> int:
 
 def test_run_injects_dupes_and_dirty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = write_parquet(
-        tmp_path / "mes.parquet",
+        tmp_path / "month.parquet",
         [
             datetime(2024, 1, 1, 0, 3),
             datetime(2024, 1, 1, 0, 1),
@@ -157,7 +157,7 @@ def test_run_injects_dupes_and_dirty(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     messages = FakeProducer.instances[-1].messages
     events = [json.loads(value) for _, _, value in messages]
-    # ordem de envio: real, duplicata, sujo(0), real, duplicata, sujo(1), real, sujo(2), sujo(3)
+    # send order: real, duplicate, dirty(0), real, duplicate, dirty(1), real, dirty(2), dirty(3)
     assert len(events) == 3 + 2 + 4
     assert events[1] == events[0]
     assert events[4] == events[3]
@@ -178,7 +178,7 @@ def test_run_injects_dupes_and_dirty(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 
 def test_run_fails_when_limit_is_not_reached(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    path = write_parquet(tmp_path / "mes.parquet", [datetime(2024, 1, 1, 0, 1)])
+    path = write_parquet(tmp_path / "month.parquet", [datetime(2024, 1, 1, 0, 1)])
 
     FakeProducer.instances.clear()
     monkeypatch.setattr(replay, "Producer", FakeProducer)
@@ -188,7 +188,7 @@ def test_run_fails_when_limit_is_not_reached(monkeypatch: pytest.MonkeyPatch, tm
 
 def test_run_fails_when_delivery_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = write_parquet(
-        tmp_path / "mes.parquet",
+        tmp_path / "month.parquet",
         [datetime(2024, 1, 1, 0, 1), datetime(2024, 1, 1, 0, 2)],
     )
 

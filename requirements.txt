@@ -1,10 +1,10 @@
-# Versões pinadas (Python 3.12 via uv).
-# pyspark 4.3.0 → conector Kafka correspondente é org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0
+# Pinned versions (Python 3.12 via uv).
+# pyspark 4.3.0 → matching Kafka connector is org.apache.spark:spark-sql-kafka-0-10_2.13:4.3.0
 pyspark==4.3.0
 confluent-kafka==2.16.2
 psycopg[binary]==3.3.9
-pandas==2.3.3            # 3.x ainda nao suportado pelo PySpark 4.3
+pandas==2.3.3            # 3.x not supported by PySpark 4.3 yet
 pyarrow==26.0.1
-# Ferramentas de teste (uv run pytest / uv run ruff) — pinadas aqui para não instalar solto.
+# Test tools (uv run pytest / uv run ruff) — pinned here so they are not installed ad hoc.
 pytest==9.2.0
 ruff==0.17.6

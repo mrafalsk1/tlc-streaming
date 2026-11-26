@@ -1,39 +1,39 @@
-"""Ramo Silver: validação, filtro de atraso e upsert idempotente no Postgres.
+"""Silver branch: validation, late filter and idempotent upsert into Postgres.
 
-O Bronze aceita tudo; é aqui que o evento é classificado. A ordem é a do contrato (docs/notes.md):
-validação → filtro de atraso → upsert. A dedup **não** é stateful: quem deduplica é o
-`PRIMARY KEY (trip_id)` do Postgres, então o estado do Spark não cresce com o stream.
+Bronze accepts everything; this is where the event is classified. The order is the contract one
+(docs/notes.md): validation → late filter → upsert. Deduplication is **not** stateful: the Postgres
+`PRIMARY KEY (trip_id)` does it, so the Spark state does not grow with the stream.
 
-Cinco decisões que não são óbvias:
+Five decisions that are not obvious:
 
-* **Watermark do lote anterior, por partição.** O filtro lê `silver.stream_state.watermark`, gravado
-  pelo lote anterior, e só depois grava o watermark deste lote. O valor é o **menor** dos
-  `max(event_time)` de cada partição do Kafka: o replay é particionado por zona e o limite de
-  offsets por trigger é dividido igualmente entre as partições, então elas avançam em ritmos
-  diferentes de event-time (num lote de 8k, as fatias chegam a variar ~6 h). Usar o máximo global
-  faria a partição mais adiantada declarar "atrasado" o que é só a vez das outras. O menor máximo é
-  o ponto até onde todos os inputs avançaram — o watermark clássico. Se usasse o max do próprio
-  lote, o primeiro evento do replay (outlier de 2002) já nasceria atrasado. Watermark NULL =
-  primeiro lote, aceita tudo. A atualização usa `GREATEST`: watermark nunca regride.
-* **`is_valid_trip` com três valores.** Comparação com nulo devolve nulo, e um nulo gravado numa
-  coluna `NOT NULL` derruba o lote. Por isso cada regra é um `coalesce(..., false)` e o resultado é
-  negado: nulo em `fare_amount` não invalida a linha. O teto compara o valor **arredondado** a 2
-  casas, o mesmo que o `trip_id` do produtor usa (`%.2f`).
-* **Contadores saem do upsert, num livro-caixa no banco.** `ON CONFLICT DO UPDATE` conta insert e
-  update igual; `RETURNING (xmax = 0)` separa os dois. `invalid` = gravadas com `is_valid_trip =
-  false`; `duplicates_dropped` = linhas que o upsert não inseriu (duplicata dentro do lote ou
-  conflito com linha existente). A duplicata de um evento inválido conta só como duplicata. O
-  resultado do lote vai para `silver.batch_runs` na mesma transação, com PK na identidade do lote
-  (faixas de offset por partição): um lote reexecutado pelo checkpoint não soma duas vezes, e
-  `data/state/counters.json` é a soma da tabela.
-* **Tempo sai do Spark como texto.** `collect()` converte `TIMESTAMP` para o fuso **local do driver**
-  (não o `spark.sql.session.timeZone`), o que deslocaria o relógio de NY e os instantes em 3 h numa
-  máquina em UTC-3. `copy_frame` formata no fuso da sessão (UTC) e o Postgres recebe a string com a
-  sessão em UTC: nada é reinterpretado no caminho.
-* **Linha que não cabe no destino não derruba o pipeline.** `trip_id` nulo (JSON corrompido) é
-  inválido mas não tem PK; `pickup_at`/`emit_time` nulos violam `NOT NULL`; `trip_id` com NUL não
-  atravessa o COPY (o psycopg recusa, mesmo escapando TAB/quebra de linha). Esses casos contam em
-  `rejected` e continuam no Bronze.
+* **Watermark from the previous batch, per partition.** The filter reads
+  `silver.stream_state.watermark`, written by the previous batch, and only then writes this batch's
+  watermark. The value is the **lowest** `max(event_time)` across Kafka partitions: the replay is
+  keyed by zone and the per-trigger offset cap is split evenly across partitions, so they advance at
+  different event-time rates (in an 8k batch the slices differed by up to ~6 h). Using the global max
+  would make the fastest partition call "late" rows that are just the others' turn. The lowest max
+  is the point every input has passed — the classic watermark. Using the current batch's own max
+  would make the first replay event (the 2002 outlier) late right away. NULL = first batch, accepts
+  everything. The update uses `GREATEST`: the watermark never goes back.
+* **`is_valid_trip` with three values.** Comparison with null returns null, and a null written into a
+  `NOT NULL` column kills the batch. So each rule is a `coalesce(..., false)` and the result is
+  negated: a null `fare_amount` does not invalidate the row. The ceiling compares the value
+  **rounded** to 2 decimals, the same the producer's `trip_id` uses (`%.2f`).
+* **Counters come from the upsert, in a database ledger.** `ON CONFLICT DO UPDATE` counts inserts
+  and updates alike; `RETURNING (xmax = 0)` separates them. `invalid` = rows stored with
+  `is_valid_trip = false`; `duplicates_dropped` = rows the upsert did not insert (a duplicate inside
+  the batch or a conflict with an existing row). The duplicate of an invalid event counts only as a
+  duplicate. The batch result goes to `silver.batch_runs` in the same transaction, keyed by the
+  batch identity (offset ranges per partition): a batch re-executed by the checkpoint is not counted
+  twice, and `data/state/counters.json` is the table sum.
+* **Time leaves Spark as text.** `collect()` converts `TIMESTAMP` to the **driver's local** timezone
+  (not `spark.sql.session.timeZone`), which would shift the New York wall clock and the instants by
+  3 h on a UTC-3 machine. `copy_frame` formats in the session timezone (UTC) and Postgres receives
+  the string with the session in UTC: nothing is reinterpreted on the way.
+* **A row that does not fit the destination must not kill the pipeline.** A null `trip_id` (corrupt
+  JSON) is invalid but has no PK; null `pickup_at`/`emit_time` violate `NOT NULL`; a `trip_id` with
+  NUL cannot cross the COPY (psycopg refuses it, even though it escapes TAB/newline). Those cases
+  count as `rejected` and stay in Bronze.
 """
 
 from __future__ import annotations
@@ -55,11 +55,11 @@ DEFAULT_DSN = os.environ.get(
     "SILVER_DSN", "postgresql://stream:stream@localhost:5434/streaming"
 )
 DEFAULT_COUNTERS_PATH = "data/state/counters.json"
-# Formato que atravessa Spark → Postgres. Microssegundos para não perder `ingested_at`.
+# Format that crosses Spark → Postgres. Microseconds so `ingested_at` is not truncated.
 TS_FORMAT = "yyyy-MM-dd HH:mm:ss.SSSSSS"
 
-# Ordem = ordem das colunas no COPY e no INSERT. `event_time` e `pickup_at` guardam o mesmo valor:
-# a tabela mantém os dois nomes por compatibilidade com a janela por zona e com a reconciliação.
+# Order = column order in the COPY and the INSERT. `event_time` and `pickup_at` hold the same value:
+# the table keeps both names for the zone window and for the reconciliation.
 SILVER_COLUMNS: tuple[str, ...] = (
     "trip_id",
     "pickup_at",
@@ -108,8 +108,8 @@ CREATE TEMP TABLE {_STAGING} (
 ) ON COMMIT DROP
 """
 
-# `DISTINCT ON` colapsa a duplicata que chega dentro do mesmo lote: `ON CONFLICT DO UPDATE` recusa
-# afetar a mesma linha duas vezes na mesma instrução (ao contrário de `DO NOTHING`).
+# `DISTINCT ON` collapses a duplicate that arrives inside the same batch: `ON CONFLICT DO UPDATE`
+# refuses to affect the same row twice in the same statement (unlike `DO NOTHING`).
 _UPSERT_SQL = f"""
 WITH incoming AS (
     SELECT DISTINCT ON (trip_id) {_COLUMNS_SQL}
@@ -153,7 +153,7 @@ _SUM_COUNTERS_SQL = (
 
 @dataclass
 class BatchResult:
-    """O que este lote fez com o Silver. Vai para `silver.batch_runs` e para os contadores."""
+    """What this batch did to the Silver. Goes to `silver.batch_runs` and to the counters."""
 
     consumed: int = 0
     valid_stored: int = 0
@@ -164,23 +164,23 @@ class BatchResult:
 
 
 def to_silver_events(df: DataFrame) -> DataFrame:
-    """Evento cru do Bronze → colunas do Silver, com `is_valid_trip` calculado.
+    """Raw Bronze event → Silver columns, with `is_valid_trip` computed.
 
-    `event_time`/`dropoff_at` chegam como texto naive de NY; `try_to_timestamp` na sessão UTC mantém
-    o relógio de parede como está (não desloca), que é o contrato das colunas `TIMESTAMP` do Silver.
-    `emit_time` carrega offset no texto e vira o instante correto. O `try_` é obrigatório: no Spark 4
-    o ANSI vem ligado e um timestamp malformado **levanta exceção** em vez de virar nulo — um único
-    registro ruim travaria o lote para sempre.
+    `event_time`/`dropoff_at` arrive as New York naive text; `try_to_timestamp` in the UTC session
+    keeps the wall clock as it is (no shift), which is the contract of the Silver `TIMESTAMP`
+    columns. `emit_time` carries an offset in the text and becomes the correct instant. The `try_`
+    is mandatory: Spark 4 has ANSI on and a malformed timestamp **raises** instead of becoming null —
+    a single bad record would stall the batch forever.
     """
     pickup_at = F.try_to_timestamp("event_time")
     dropoff_at = F.try_to_timestamp("dropoff_at")
     emit_time = F.try_to_timestamp("emit_time")
     duration_seconds = F.unix_timestamp(dropoff_at) - F.unix_timestamp(pickup_at)
-    # O `trip_id` do produtor usa `%.2f` do total; comparar o double cru criaria dois ids para o
-    # mesmo valor quando a diferença está além da segunda casa.
+    # The producer's `trip_id` uses `%.2f` of the total; comparing the raw double would create two
+    # ids for the same value when the difference is beyond the second decimal.
     total_amount = F.round(F.col("total_amount"), 2)
-    # `try_cast`: valor fora da faixa do NUMERIC(10,2) vira NULL em vez de derrubar o lote. Mas a
-    # linha não pode ser dada como válida com a tarifa perdida no caminho.
+    # `try_cast`: a value outside NUMERIC(10,2) becomes NULL instead of killing the batch. But the
+    # row cannot be reported as valid with the fare lost on the way.
     fare_stored = F.col("fare_amount").try_cast("decimal(10, 2)")
     total_stored = F.col("total_amount").try_cast("decimal(10, 2)")
     unstorable_amount = (F.col("fare_amount").isNotNull() & fare_stored.isNull()) | (
@@ -218,10 +218,10 @@ def to_silver_events(df: DataFrame) -> DataFrame:
 
 
 def copy_frame(df: DataFrame) -> DataFrame:
-    """Colunas prontas para o COPY: instantes como texto no fuso da sessão (UTC).
+    """Columns ready for COPY: timestamps as text in the session timezone (UTC).
 
-    Ver a decisão 4 do módulo: `collect()` de `TIMESTAMP` usa o fuso local do driver e deslocaria as
-    colunas de NY. Texto no formato `TS_FORMAT` atravessa sem reinterpretação.
+    See decision 4 of the module: `collect()` of a `TIMESTAMP` uses the driver's local timezone and
+    would shift the New York columns. Text in `TS_FORMAT` crosses without reinterpretation.
     """
     return df.select(
         F.col("trip_id"),
@@ -242,11 +242,12 @@ def copy_frame(df: DataFrame) -> DataFrame:
 
 
 def apply_late_filter(df: DataFrame, watermark: datetime | None) -> DataFrame:
-    """Descarta evento com atraso > 10 min em relação ao watermark do lote anterior.
+    """Drop events more than 10 min behind the previous batch's watermark.
 
-    Watermark NULL é o primeiro lote: aceita tudo. O `watermark` vem do Postgres como `datetime`
-    naive (relógio de NY); o corte é serializado em texto para o Spark não interpretá-lo no fuso
-    local do driver. Linha sem `event_time` não é julgada aqui: conta como `rejected` adiante.
+    A NULL watermark is the first batch: accepts everything. The watermark comes from Postgres as a
+    naive `datetime` (New York clock); the cutoff is serialized as text so Spark does not interpret
+    it in the driver's local timezone. A row without `event_time` is not judged here: it counts as
+    `rejected` later.
     """
     if watermark is None:
         return df
@@ -258,12 +259,12 @@ def apply_late_filter(df: DataFrame, watermark: datetime | None) -> DataFrame:
 
 
 def batch_bounds(batch: DataFrame) -> tuple[str, str | None]:
-    """Identidade do lote e watermark, numa passada só.
+    """Batch identity and watermark, in a single pass.
 
-    * Identidade = faixas `(min, max)` de offset por partição. É estável quando o checkpoint
-      reexecuta o lote, então a PK de `silver.batch_runs` absorve a repetição.
-    * Watermark = menor dos `max(event_time)` por partição, como texto. A partição mais lenta é
-      quem manda: só abaixo dela o pipeline tem certeza de que nenhum input vai voltar.
+    * Identity = `(min, max)` offset ranges per partition. It is stable when the checkpoint
+      re-executes the batch, so the `silver.batch_runs` PK absorbs the repetition.
+    * Watermark = the lowest `max(event_time)` across partitions, as text. The slowest partition is
+      in charge: only below it is the pipeline sure no input will go back.
     """
     rows = (
         batch.groupBy("kafka_partition")
@@ -276,17 +277,17 @@ def batch_bounds(batch: DataFrame) -> tuple[str, str | None]:
         .collect()
     )
     key = ";".join(f"{row.kafka_partition}:{row.lo}-{row.hi}" for row in rows)
-    # Formato fixo de largura constante: a ordem lexicográfica é a ordem temporal.
+    # Fixed-width format: lexicographic order is chronological order.
     events = [row.max_event for row in rows if row.max_event is not None]
     return key, min(events) if events else None
 
 
 def storable_filter(df: DataFrame) -> DataFrame:
-    """Linha que o Postgres aceita.
+    """Row that Postgres accepts.
 
-    `trip_id` é PK e `pickup_at`/`emit_time` são `NOT NULL`; um nulo derrubaria o lote inteiro e o
-    checkpoint ficaria preso no mesmo offset. NUL não atravessa o COPY (o psycopg recusa qualquer
-    byte 0x00 num texto); TAB/quebra de linha/barra são escapados pelo próprio psycopg.
+    `trip_id` is the PK and `pickup_at`/`emit_time` are `NOT NULL`; a null would kill the whole batch
+    and the checkpoint would stay stuck on the same offset. NUL does not cross the COPY (psycopg
+    refuses any 0x00 byte in text); TAB/newline/backslash are escaped by psycopg itself.
     """
     return df.where(
         F.col("trip_id").isNotNull()
@@ -297,7 +298,7 @@ def storable_filter(df: DataFrame) -> DataFrame:
 
 
 def save_counters(path: Path, counters: dict) -> None:
-    """Grava de forma atômica: o leitor nunca vê o arquivo pela metade."""
+    """Write atomically: a reader never sees a half-written file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(counters, indent=2) + "\n", encoding="utf-8")
@@ -305,10 +306,10 @@ def save_counters(path: Path, counters: dict) -> None:
 
 
 def export_counters(conn: psycopg.Connection, path: Path) -> dict:
-    """`data/state/counters.json` = soma de `silver.batch_runs` (não do processo).
+    """`data/state/counters.json` = sum of `silver.batch_runs` (not of the process).
 
-    Assim um lote reexecutado pelo checkpoint não soma duas vezes, e um processo que morre depois do
-    commit ainda tem os contadores do lote na próxima exportação.
+    A batch re-executed by the checkpoint is not summed twice, and a process that dies after the
+    commit still has the batch counters in the next export.
     """
     with conn.cursor() as cur:
         cur.execute(_SUM_COUNTERS_SQL)
@@ -326,11 +327,11 @@ def process_batch(
     dsn: str = DEFAULT_DSN,
     counters_path: Path | str = DEFAULT_COUNTERS_PATH,
 ) -> BatchResult:
-    """Valida, filtra atraso e faz o upsert de um micro-lote; devolve o que foi feito.
+    """Validate, filter late events and upsert one micro-batch; return what was done.
 
-    Tudo numa transação: se o upsert, o livro-caixa ou a atualização do watermark falhar, o lote é
-    repetido pelo checkpoint com o watermark antigo, e o filtro decide o mesmo que decidiria na
-    primeira tentativa. A PK de `silver.batch_runs` faz a repetição não contar duas vezes.
+    Everything in one transaction: if the upsert, the ledger or the watermark update fails, the batch
+    is repeated by the checkpoint with the old watermark, and the filter decides the same as it would
+    on the first attempt. The `silver.batch_runs` PK keeps the repetition from counting twice.
     """
     prepared = to_silver_events(batch).persist()
     try:
@@ -343,9 +344,10 @@ def process_batch(
 
         with psycopg.connect(dsn, connect_timeout=10) as conn:
             with conn.cursor() as cur:
-                # `now()` é TIMESTAMPTZ; sem fuso fixado o servidor decide o deslocamento da sessão.
+                # `now()` is TIMESTAMPTZ; without a fixed timezone the server decides the session
+                # offset.
                 cur.execute("SET TIME ZONE 'UTC'")
-                # Postgres travado ou lock concorrente não podem parar o stream em silêncio.
+                # A stuck Postgres or a concurrent lock must not stop the stream silently.
                 cur.execute("SET statement_timeout = '10min'")
                 cur.execute("SET lock_timeout = '30s'")
                 cur.execute("SELECT watermark FROM silver.stream_state WHERE id = 1")
@@ -380,21 +382,22 @@ def process_batch(
                             if was_insert and not valid
                         )
                         result.valid_stored = inserted - result.invalid
-                        # Linha que entrou no COPY e não virou INSERT: duplicata no lote ou
-                        # conflito com linha já existente. É a dedup do PK, não do Spark.
+                        # A row that entered the COPY and did not become an INSERT: a duplicate in
+                        # the batch or a conflict with an existing row. It is the PK dedup, not
+                        # Spark's.
                         result.duplicates_dropped = storable_rows - inserted
-                        # Checagem real, antes do commit: o DISTINCT ON tem que devolver uma linha
-                        # por trip_id distinto do lote.
+                        # Real check, before the commit: DISTINCT ON must return one row per
+                        # distinct trip_id in the batch.
                         if len(returned) != distinct_ids:
                             raise RuntimeError(
-                                f"lote {batch_id}: DISTINCT ON devolveu {len(returned)} linhas "
-                                f"para {distinct_ids} trip_id distintos"
+                                f"batch {batch_id}: DISTINCT ON returned {len(returned)} rows "
+                                f"for {distinct_ids} distinct trip_id"
                             )
 
                     cur.execute(_INSERT_BATCH_RUN_SQL, {"batch_key": batch_key, **asdict(result)})
                     if batch_max is not None:
-                        # GREATEST: um lote só com evento antigo (ou uma partição ausente) não pode
-                        # fazer o watermark voltar.
+                        # GREATEST: a batch with only old events (or a missing partition) cannot
+                        # move the watermark back.
                         cur.execute(
                             "UPDATE silver.stream_state SET watermark = "
                             "GREATEST(COALESCE(watermark, %s::timestamp), %s::timestamp), "

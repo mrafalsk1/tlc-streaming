@@ -1,21 +1,21 @@
-"""Baixa o conector Kafka do Spark para `jars/` (uma vez, com rede).
+"""Download the Spark Kafka connector into `jars/` (once, with network).
 
-O download usa um Ivy **próprio** (`jars/.ivy`, coberto pelo `.gitignore` do `jars/`) em vez do
-cache do usuário: assim os jars copiados são exatamente os que o POM do conector resolveu. Varrer
-`~/.ivy2*` pegaria a versão mais nova de cada artefato em qualquer projeto da máquina — uma
-`kafka-clients 4.x` de outro trabalho entraria no Bronze sem aviso.
+The download uses its **own** Ivy (`jars/.ivy`, covered by the `jars/` `.gitignore`) instead of the
+user cache: that way the copied jars are exactly the ones the connector POM resolved. Scanning
+`~/.ivy2*` would pick the newest version of each artifact from any project on the machine — a
+`kafka-clients 4.x` from another job would enter Bronze without warning.
 
-Detalhe do Spark 4: ele usa Ivy 2.5.2 e achata o nome do jar
-(`org.apache.spark_spark-sql-kafka-0-10_2.13-4.3.0.jar`), então o casamento é por trecho, não por
-prefixo. Depois do primeiro download o job roda **offline**, com `spark.jars` apontando para `jars/`.
+Spark 4 detail: it uses Ivy 2.5.2 and flattens the jar name
+(`org.apache.spark_spark-sql-kafka-0-10_2.13-4.3.0.jar`), so matching is by substring, not by
+prefix. After the first download the job runs **offline**, with `spark.jars` pointing at `jars/`.
 
-Uso:
-    make jars                                      # baixa e copia (pula se já estiver completo)
-    uv run python scripts/fetch_jars.py --force    # refaz o download e sobrescreve jars/
+Usage:
+    make jars                                      # download and copy (skip if already complete)
+    uv run python scripts/fetch_jars.py --force    # download again and overwrite jars/
 
-Os quatro artefatos que o Spark **não** distribui (o resto das dependências do conector já vem no
-`pyspark/jars`): `spark-sql-kafka-0-10`, `spark-token-provider-kafka`, `kafka-clients` e
-`commons-pool2` (o Spark traz `commons-pool` 1.5.4, que não serve).
+The four artifacts Spark does **not** ship (the rest of the connector dependencies already come in
+`pyspark/jars`): `spark-sql-kafka-0-10`, `spark-token-provider-kafka`, `kafka-clients` and
+`commons-pool2` (Spark brings `commons-pool` 1.5.4, which does not work).
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ VERSION_RE = re.compile(r"-(\d+(?:\.\d+)+)\.jar$")
 
 
 def artifact_of(name: str) -> str | None:
-    """Artefato dono do arquivo, casando por trecho (`kafka-clients` ≠ `spark-sql-kafka-0-10`)."""
+    """Artifact that owns the file, matched by substring (`kafka-clients` ≠ `spark-sql-kafka-0-10`)."""
     for artifact in ARTIFACTS:
         if artifact in name:
             return artifact
@@ -52,7 +52,7 @@ def version_key(name: str) -> tuple[int, ...]:
 
 
 def download(ivy_dir: Path) -> None:
-    print(f"resolvendo {CONNECTOR} via Ivy em {ivy_dir} (precisa de rede)...", flush=True)
+    print(f"resolving {CONNECTOR} through Ivy in {ivy_dir} (needs network)...", flush=True)
     spark = (
         SparkSession.builder.master("local[1]")
         .appName("fetch-jars")
@@ -65,7 +65,7 @@ def download(ivy_dir: Path) -> None:
 
 
 def find_candidates(ivy_dir: Path) -> dict[str, list[Path]]:
-    """Jars de cada artefato no Ivy dedicado (`<ivy>/jars` e `<ivy>/cache`)."""
+    """Jars of each artifact in the dedicated Ivy (`<ivy>/jars` and `<ivy>/cache`)."""
     found: dict[str, list[Path]] = {artifact: [] for artifact in ARTIFACTS}
     for root in (ivy_dir / "jars", ivy_dir / "cache"):
         if not root.is_dir():
@@ -80,9 +80,9 @@ def find_candidates(ivy_dir: Path) -> dict[str, list[Path]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Copia o conector Kafka do Ivy para jars/.")
+    parser = argparse.ArgumentParser(description="Copy the Kafka connector from Ivy into jars/.")
     parser.add_argument("--dest", default="jars")
-    parser.add_argument("--force", action="store_true", help="baixa de novo e sobrescreve jars/")
+    parser.add_argument("--force", action="store_true", help="download again and overwrite jars/")
     args = parser.parse_args(argv)
 
     dest = Path(args.dest)
@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     present = {artifact_of(path.name) for path in dest.glob("*.jar")}
     complete = all(artifact in present for artifact in ARTIFACTS)
     if complete and not args.force:
-        print(f"{dest}/ já tem os {len(ARTIFACTS)} artefatos — nada a fazer (use --force para refazer)")
+        print(f"{dest}/ already has the {len(ARTIFACTS)} artifacts — nothing to do (use --force to redo)")
         return 0
 
     ivy_dir = dest / ".ivy"
@@ -101,8 +101,8 @@ def main(argv: list[str] | None = None) -> int:
 
     missing = [artifact for artifact in ARTIFACTS if not candidates[artifact]]
     if missing:
-        print(f"não achei no Ivy de {ivy_dir}: {', '.join(missing)}", file=sys.stderr)
-        print("o download falhou (sem rede?) — veja o erro do Spark acima", file=sys.stderr)
+        print(f"not found in the Ivy of {ivy_dir}: {', '.join(missing)}", file=sys.stderr)
+        print("the download failed (no network?) — check the Spark error above", file=sys.stderr)
         return 1
 
     for artifact in ARTIFACTS:
@@ -111,14 +111,14 @@ def main(argv: list[str] | None = None) -> int:
         if target.exists() and not args.force:
             print(f"ok       {newest.name}")
             continue
-        # `--force` também limpa versões antigas do mesmo artefato para o classpath não ter duas.
+        # `--force` also removes old versions of the same artifact so the classpath has no two.
         for stale in dest.glob("*.jar"):
             if stale.name != target.name and artifact_of(stale.name) == artifact:
                 stale.unlink()
         shutil.copy2(newest, target)
-        print(f"copiado  {newest.name}")
+        print(f"copied   {newest.name}")
 
-    print(f"\n{len(list(dest.glob('*.jar')))} jars em {dest}/ — o job roda offline a partir daqui")
+    print(f"\n{len(list(dest.glob('*.jar')))} jars in {dest}/ — the job runs offline from here")
     return 0
 
 

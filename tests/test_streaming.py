@@ -1,8 +1,8 @@
-"""Parse do Bronze sem broker: contrato do schema, JSON corrompido e partição em UTC.
+"""Bronze parse without a broker: schema contract, corrupt JSON and the UTC partition.
 
-Não sobe Kafka: `parse_events` recebe o DataFrame que o `readStream` produziria (`value`,
-`partition`, `offset`). O que se testa aqui é o que pode quebrar em silêncio — ordem das colunas,
-tipo do `payment_type`, mensagem corrompida e partição dependente de fuso.
+It does not start Kafka: `parse_events` receives the DataFrame `readStream` would produce (`value`,
+`partition`, `offset`). What is tested here is what can break silently — column order, the
+`payment_type` type, a corrupt message and the timezone-dependent partition.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def spark() -> SparkSession:
     session = (
         SparkSession.builder.master("local[1]")
         .appName("test-streaming")
-        # Mesmo fuso do job: a partição do Bronze é UTC (ver add_ingest_columns).
+        # Same timezone as the job: the Bronze partition is UTC (see add_ingest_columns).
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "2")
         .config("spark.ui.enabled", "false")
@@ -48,7 +48,7 @@ def spark() -> SparkSession:
 
 
 def topic_frame(spark: SparkSession, payloads: list[bytes]):
-    """O que o conector Kafka entrega: `value` binário + posição no tópico."""
+    """What the Kafka connector delivers: binary `value` + topic position."""
     rows = [(payload, 3, 100 + i) for i, payload in enumerate(payloads)]
     return spark.createDataFrame(rows, "value binary, partition int, offset long")
 
@@ -65,7 +65,7 @@ def test_parse_events_keeps_values_and_order(spark: SparkSession) -> None:
 
     assert frame.columns == list(EVENT_FIELDS) + ["kafka_partition", "kafka_offset"]
     assert row.trip_id == EVENT["trip_id"]
-    # Timestamp fica texto no Bronze: quem interpreta o fuso é o Silver.
+    # The timestamp stays text in Bronze: the Silver is the one interpreting the timezone.
     assert row.event_time == EVENT["event_time"]
     assert row.emit_time == EVENT["emit_time"]
     assert row.pickup_zone_id == 114
@@ -77,7 +77,8 @@ def test_parse_events_turns_corrupt_json_into_nulls(spark: SparkSession) -> None
     frame = parse_events(topic_frame(spark, [b'{"trip_id": "x", ']))
     row = frame.collect()[0]
 
-    # PERMISSIVE: a linha entra (Bronze cru) e o trip_id nulo é invalidado no Silver.
+    # PERMISSIVE: the row enters (raw Bronze) and the null trip_id has no PK in the Silver, so it
+    # becomes `rejected` there.
     assert row.trip_id is None
     assert row.kafka_offset == 100
 

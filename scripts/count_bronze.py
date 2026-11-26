@@ -1,13 +1,13 @@
-"""Conta o Bronze em Parquet **sem subir JVM** — verificação do ingest.
+"""Count the Bronze in Parquet **without starting a JVM** — ingest verification.
 
-`pyarrow.dataset` lê só o metadado dos arquivos para o total de linhas (rápido mesmo com muitos
-arquivos) e entende as pastas Hive-style `ingest_date=/hour=/` geradas pelo job. Com `--check`,
-lê também `trip_id` e a posição no Kafka para responder as duas perguntas do restart test:
-quantos eventos chegaram sem `trip_id` (corrompidos) e quantas linhas repetem
-`(kafka_partition, kafka_offset)` (o at-least-once do Bronze).
+`pyarrow.dataset` reads only the file metadata for the row total (fast even with many files) and
+understands the Hive-style `ingest_date=/hour=/` folders the job writes. With `--check`, it also
+reads `trip_id` and the Kafka position to answer the restart test's two questions: how many events
+arrived without a `trip_id` (corrupt) and how many rows repeat `(kafka_partition, kafka_offset)`
+(the Bronze at-least-once).
 
-Uso:
-    make bronze                    # total de linhas e arquivos
+Usage:
+    make bronze                    # row and file totals
     make bronze BRONZE_ARGS=--check
 """
 
@@ -20,19 +20,19 @@ import pyarrow.dataset as ds
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Conta linhas do Bronze em Parquet.")
+    parser = argparse.ArgumentParser(description="Count the Bronze rows in Parquet.")
     parser.add_argument("--dir", default="data/bronze")
     parser.add_argument(
         "--check",
         action="store_true",
-        help="também conta trip_id nulo e offsets repetidos",
+        help="also count null trip_id and repeated offsets",
     )
     args = parser.parse_args(argv)
 
     path = Path(args.dir)
     files = sorted(path.rglob("*.parquet"))
     if not files:
-        print(f"nenhum parquet em {path} — rode 'make stream'")
+        print(f"no parquet in {path} — run 'make stream'")
         return 1
 
     dataset = ds.dataset(path, format="parquet", partitioning="hive")

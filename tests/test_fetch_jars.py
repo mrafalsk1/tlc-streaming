@@ -1,7 +1,7 @@
-"""Testes do `fetch_jars` sem rede: o casamento do nome achatado que o Ivy 2.5.2 gera.
+"""`fetch_jars` tests without network: matching the flattened name Ivy 2.5.2 generates.
 
-O risco real é copiar o artefato errado — `commons-pool` 1.5.4 (que o Spark já traz) no lugar de
-`commons-pool2`, ou a `kafka-clients` de outro projeto. `artifact_of` é o que impede isso.
+The real risk is copying the wrong artifact — `commons-pool` 1.5.4 (which Spark already ships) in
+place of `commons-pool2`, or another project's `kafka-clients`. `artifact_of` is what prevents that.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ def test_artifact_of_matches_the_flattened_ivy_names() -> None:
 
 
 def test_artifact_of_does_not_steal_the_spark_bundled_commons_pool() -> None:
-    # O Spark distribui commons-pool 1.5.4; o conector exige o pool2. Confundir os dois quebra em
-    # runtime (NoClassDefFoundError) já depois do job começar.
+    # Spark ships commons-pool 1.5.4; the connector requires pool2. Confusing the two breaks at
+    # runtime (NoClassDefFoundError) after the job has already started.
     assert artifact_of("commons-pool-1.5.4.jar") is None
     assert artifact_of("hadoop-client-runtime-3.5.0.jar") is None
 
@@ -33,4 +33,4 @@ def test_version_key_orders_numerically() -> None:
     assert version_key("org.apache.kafka_kafka-clients-3.9.2.jar") > version_key(
         "org.apache.kafka_kafka-clients-3.8.10.jar"
     )
-    assert version_key("sem-versao.jar") == (0,)
+    assert version_key("no-version.jar") == (0,)

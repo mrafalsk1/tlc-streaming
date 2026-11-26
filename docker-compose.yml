@@ -2,10 +2,10 @@ name: tlc-streaming
 
 services:
   redpanda:
-    image: redpandadata/redpanda:v26.3.1   # pinado: versão validada no setup
-    restart: unless-stopped                 # sem isto o stack não volta quando o WSL reinicia
-    # Dois listeners: o externo (9092) é anunciado como localhost para o host;
-    # o interno (29092) é anunciado como "redpanda" para o Console, dentro da rede.
+    image: redpandadata/redpanda:v26.3.1   # pinned: version validated in the setup
+    restart: unless-stopped                 # without this the stack does not come back when WSL restarts
+    # Two listeners: the external one (9092) is advertised as localhost to the host;
+    # the internal one (29092) is advertised as "redpanda" to the Console, inside the network.
     command: >
       redpanda start
       --smp 1
