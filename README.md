@@ -5,7 +5,8 @@ events into Redpanda (Kafka API), Spark Structured Streaming validates and lands
 (Parquet) and a Silver layer (Postgres), and dbt models the Gold layer on top of Silver.
 
 **Status:** the producer, the Bronze layer and the Silver layer (validation, late filter, idempotent
-upsert, zone window) are running; dbt (Gold) and the metrics are next. Numbers and diagrams land as
+upsert, zone window) are running and pass the restart test with zero duplicate `trip_id`; dbt (Gold)
+and the metrics are next. Numbers and diagrams land as
 they are measured — nothing in this README is estimated.
 
 ```
@@ -40,6 +41,7 @@ make counters     # incremental Silver counters (invalid / late / duplicates / r
 make silver-stats # Silver row counts (rows, distinct trip_ids, invalid)
 make windows      # zone window totals + the reconciliation against the valid Silver rows
 make windows-backfill # rebuild zone_demand_5min from trip_events (repair; stop the job first)
+make restart-test # kill -9 mid-stream, restart from the checkpoint and compare (destructive)
 make test    # pytest of the producer and the streaming job
 make lint    # ruff on producer, streaming, scripts and tests
 make down    # keeps the volumes
@@ -142,6 +144,43 @@ and every aggregate column of the windows unchanged (`md5` over `pickup_zone_id,
 window_end, trips, revenue, avg_duration_min` identical; `updated_at` is rewritten by design and is
 not an incremental marker). `make windows` runs the reconciliation.
 
+## Restart test
+
+`make restart-test` runs the whole check: it resets the lab (Bronze, Silver, topic), replays 100k
+events, **kills the job with `kill -9`** while a micro-batch is written to Bronze and not yet
+committed, restarts it from the same checkpoint and drains. The crash is timed on the Parquet
+metadata (`pyarrow` poll), not on a fixed sleep, so the kill lands inside the batch on purpose.
+Destructive: the target exists for this test, not for the steady-state lab.
+
+Measured (`docs/restart-test.txt` is the report the target regenerates):
+
+| | right after the kill | after the restart and the drain |
+|---|---|---|
+| checkpoint commits | `0` | `0 1 2` |
+| Bronze rows / files | 99,994 / 12 | 149,996 / 24 |
+| Bronze distinct `(partition, offset)` | 99,994 | 100,000 |
+| Silver rows | 49,998 | 100,000 |
+| `silver.batch_runs` | 1 | 3 |
+
+The killed micro-batch (49,996 events) had finished its Parquet write and left nothing in Silver:
+the batch's Postgres work is atomic, so Silver stayed at batch 0 while the Parquet stayed. On restart
+the checkpoint replays that offset range, so the same 49,996 rows are appended to Bronze a second
+time — `offset_duplicates = 49,996` over 100,000 distinct pairs, no event lost — while the Silver
+upsert re-inserts the rows the crash rolled back, because there was no committed row to conflict
+with (`duplicates_dropped = 0`).
+
+End state: `count(*) = count(distinct trip_id) = 100,000` in Silver, `consumed = 100,000` in the
+counters, 98,421 valid trips and the zone windows reconciled against them. The dedup here is the
+`PRIMARY KEY (trip_id)` upsert, not the counter: the duplication stays in Bronze, the append-only
+audit layer. The restart does not wait for the dead consumer to be evicted: the offsets come from
+the checkpoint, not from the group (`kafka.session.timeout.ms` is 10 s in the job, Kafka's default is
+45 s). The timestamps of the run are in the report.
+
+The run asserts the crash instead of assuming it: the checkpoint must stop at batch 0, the Bronze
+must grow past it before the kill and the final Bronze must repeat offsets (`offset_duplicates >= 1`)
+— a kill that landed between batches fails the checks. It also refuses to start with a stream job
+running, since both would share the checkpoint and the `group.id`.
+
 ## Design decisions
 
 | Decision | Why | Trade-off accepted |
@@ -166,7 +205,8 @@ including here.
 
 - Single Redpanda node, single Spark local mode, no replication.
 - Bronze is append at-least-once: a crash between the Parquet write and the checkpoint commit
-  duplicates rows in Bronze by design (and that duplication is measured, not hidden).
+  duplicates rows in Bronze by design — 49,996 rows in the restart test — and that duplication is
+  measured, not hidden; the Silver converges because the upsert is idempotent.
 - Synthetic `trip_id` (SHA-1 of the natural key) — the TLC dataset has no trip id.
 
 ## Next steps

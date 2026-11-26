@@ -98,6 +98,9 @@ windows-backfill: ## Rebuild zone_demand_5min from trip_events (repair; stop the
 	@$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -U stream -d streaming < scripts/backfill_windows.sql
 	@$(MAKE) --no-print-directory windows
 
+restart-test: ## kill -9 mid-stream, restart from the checkpoint and compare (lab; destructive)
+	@bash scripts/restart_test.sh
+
 counters: ## Show the incremental Silver counters
 	@test -f data/state/counters.json && uv run python -m json.tool data/state/counters.json || echo "no counters yet"
 
@@ -107,4 +110,4 @@ ps: ## Container status
 logs: ## Redpanda logs
 	@$(COMPOSE) logs -f redpanda
 
-.PHONY: help up down clean topic produce test lint venv deps check-java smoke jars stream bronze bronze-reset silver silver-reset silver-stats windows windows-backfill counters ps logs
+.PHONY: help up down clean topic produce test lint venv deps check-java smoke jars stream bronze bronze-reset silver silver-reset silver-stats windows windows-backfill counters ps logs restart-test

@@ -427,3 +427,74 @@ Riscos latentes documentados, não corrigidos: o recálculo só toca a janela **
 `trip_id` já gravado mudar de zona ou `pickup_at` (hoje impossível, o hash cobre os dois), a janela
 antiga fica com a contagem velha, e o backfill é a saída; e o `statement_timeout = '10min'` agora
 cobre também a varredura da janela (no lab, 0,09 s para 50k linhas contíguas / 10.442 janelas).
+
+## Restart test
+
+`scripts/restart_test.sh` + `make restart-test`: apaga Bronze, checkpoint, schema Silver e tópico,
+replay de 100.000 eventos, `kill -9` no meio do stream, restart do mesmo checkpoint e dreno. Alvo
+destrutivo — é o teste, não o lab de uso normal. Relatório em `docs/restart-test.txt` (o alvo
+reescreve).
+
+### Como o kill é cronometrado
+
+`sleep` fixo não serve: o lote termina antes ou depois. O script:
+
+1. espera a linha `batch 0: consumed=` no log e o arquivo `data/checkpoints/bronze/commits/0`;
+2. mede a linha de base depois desse commit: linhas do Bronze e do Silver do lote 0;
+3. faz polling do Parquet no próprio processo (`pyarrow.dataset.count_rows()`, a cada 50 ms) até as
+   linhas passarem da linha de base — ou seja, até o **próximo** lote ter escrito o Parquet;
+4. mata na hora o grupo de processos inteiro.
+
+Esse intervalo (Parquet escrito, checkpoint ainda no lote anterior) dura a fase Postgres do lote —
+segundos. Foi onde o kill caiu nas três rodadas. A linha de base medida (em vez de um pedaço de
+`LIMIT`) é o que impede o poll de disparar no lote 0 e o teste de passar sem crash.
+
+### Números medidos (três rodadas, idênticos; o relatório versionado é a terceira)
+
+`maxOffsetsPerTrigger=50000` é **total**, dividido proporcionalmente entre as 6 partições (não 50k
+por partição): os lotes saem 49.998 + 49.996 + 6.
+
+- Depois do kill: checkpoint `[0]`, Bronze **99.994 linhas / 12 arquivos** (0 par repetido), Silver
+  **49.998** (o lote morto não commitou; a transação é atômica, então não sobrou linha), `batch_runs`
+  = 1, nenhum backend ocupado no Postgres 2 s depois.
+- Depois do restart + dreno: Bronze **149.996 linhas / 24 arquivos**, **100.000** pares
+  `(partition, offset)` distintos e **49.996 repetidos**; Silver **100.000 = 100.000 `trip_id`**,
+  1.579 inválidos; janelas 21.238 com `sum(trips) = 98.421`; `batch_runs` = 3; contadores
+  `consumed = 100.000`.
+- `duplicates_dropped = 0` porque o lote morto não chegou a commitar: na repetição o `ON CONFLICT`
+  encontra a tabela sem aquelas linhas e insere. A dedup do restart é a PK, não o contador — o
+  contador mede duplicata **dentro** do replay, o kill mede o at-least-once do Bronze.
+- O restart voltou 3–4 s depois do kill e o dreno terminou 18–22 s depois (stamps das rodadas; o
+  relatório versionado traz os da última). Os offsets vêm do checkpoint, não do grupo: o restart não
+  espera o consumidor morto ser expulso. O `kafka.session.timeout.ms=10000` (default 45 s) é seguro,
+  mas nesta execução não foi exercitado.
+
+### O que doeu
+
+- Matar só o `make` deixa o JVM vivo com o consumidor: o script sobe o job com `setsid`, grava o
+  `$$` num arquivo e mata o **grupo** (`kill -9 -- -PGID`); o `trap EXIT` usa o mesmo grupo como rede
+  de segurança. O `session.timeout` de 10 s seria a rede se o grupo sobrevivesse, mas nesta rodada o
+  restart não esperou por ele.
+- Sem apagar o tópico, o replay novo continua a partir dos offsets antigos mesmo com checkpoint
+  novo: `rpk topic delete` + `make topic` antes do replay.
+- `silver-reset` é obrigatório: as linhas e o watermark de um dreno anterior fariam o replay entrar
+  como atrasado/duplicado (a armadilha do `make bronze-reset` sozinho).
+- O `uv run` custa ~0,5 s; chamar `make bronze` em loop não fecha a janela do kill. O polling é feito
+  dentro de um único processo Python.
+- **A primeira versão podia dar PASS sem crash** (achado da revisão): o gatilho era `rows >
+  LIMIT/2` = 50.000 e o lote 0 tem 49.998 — 2 linhas de margem. Se o lote 0 passasse de 50.000, o
+  kill cairia entre lotes e as checagens passariam com Bronze = LIMIT e 0 par repetido. Correção: a
+  linha de base é o Bronze medido **depois** do commit do lote 0, e o teste exige
+  `bronze após o kill > linha de base`, `offset_duplicates >= 1` e `bronze final > LIMIT`.
+- Estado do crash deixou de ser narrativa: o script agora confere o Silver pós-kill (igual ao lote 0
+  ou igual ao total, nunca um valor intermediário), o status de saída do dreno (arquivo escrito pelo
+  wrapper, porque `setsid ... &` esconde o `$?`) e se o grupo de processos realmente morreu.
+- `PGID_FILE` obsoleto podia apontar para um grupo reciclado: `rm -f` antes de cada `setsid`. O
+  preflight recusa rodar com `pgrep -f streaming.job` ativo (dois escritores no mesmo checkpoint e
+  `group.id`) e com `LIMIT <= 50000` (sem segundo lote, não há lote para matar).
+- `[Stage ...]` do Spark usa `\r` sem newline: o relatório filtra as linhas de lote por
+  `sed 's/\r/\n/g'` antes do `grep`, senão a barra de progresso entra no artefato.
+
+Depois deste teste o lab fica com o cenário **limpo** (100.000 eventos, sem `--dupes/--dirty`): os
+números de 100.150 dos capítulos anteriores exigem `make produce DUPES=50 DIRTY=100` para serem
+reproduzidos.

@@ -1,0 +1,73 @@
+# Restart test — 2026-11-26 19:41:21 UTC
+
+host:   Linux 6.18.40.1-microsoft-standard-WSL2, 16 cores
+limit:  100000 events
+crash:  while a micro-batch is written to Bronze and not yet committed to the checkpoint
+
+== reset: Bronze, checkpoint, Silver schema and topic
+bronze and checkpoint deleted
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to table silver.trip_events
+drop cascades to table silver.zone_demand_5min
+drop cascades to table silver.stream_state
+drop cascades to table silver.batch_runs
+silver schema recreated from scripts/init_silver.sql
+
+== produce: 100000 events, no throttle
+2026-11-26 16:41:25,802 INFO replay yellow_tripdata_2024-01.parquet
+2026-11-26 16:41:28,063 INFO done: 100000 sent, 0 duplicates, 0 dirty, 0 skipped (null pickup), 0 delivery failures, 0 unconfirmed, in 2.3s = 44232 ev/s real (44232 ev/s at the broker)
+PASS  topic end offsets (100000 = 100000)
+
+[19:41:28 UTC] == run 1: stream; kill -9 with a micro-batch written but not committed
+stream process group: 2431 (log: data/state/restart-stream.log)
+[19:41:45 UTC] batch 0 committed: silver=49998 rows, bronze=49998 rows
+waiting for the next micro-batch to write Parquet
+bronze rows=99994 with the checkpoint still at batch 0
+[19:41:46 UTC] kill -9 -- -2431
+process group gone: yes
+
+== state right after the kill (before the restart)
+checkpoint commits: [0]
+stream log (batch lines):
+  batch 0: consumed=49998 valid=49206 invalid=792 late=0 duplicates=0 rejected=0
+bronze: rows=99994 files=12
+trip_id_null=0 offset_pairs=99994 offset_duplicates=0
+silver rows: 49998 (batch 0 had 49998)
+silver batch_runs: 1
+postgres busy backends after the crash: 0
+
+[19:41:49 UTC] == restart: same checkpoint, --available-now (drain and exit)
+drain process group: 3923 (log: data/state/restart-drain.log)
+[19:42:07 UTC] drain finished (exit status 0)
+  batch 1: consumed=49996 valid=49209 invalid=787 late=0 duplicates=0 rejected=0
+  batch 2: consumed=6 valid=6 invalid=0 late=0 duplicates=0 rejected=0
+
+== final state
+bronze: rows=149996 files=24
+trip_id_null=0 offset_pairs=100000 offset_duplicates=49996
+silver: rows=100000 distinct_trip_id=100000 invalid=1579 valid=98421
+zone window: windows=21238 sum(trips)=98421
+counters: consumed=100000 duplicates_dropped=0
+silver batch_runs: 3
+the killed micro-batch had finished its Parquet write: 49996 of 49996 rows
+
+== checks
+PASS  checkpoint stopped at batch 0 (the kill landed on the next batch) (0 = 0)
+PASS  bronze after the kill above batch 0 (the next micro-batch started writing) (99994 >= 49999)
+PASS  process group gone after the kill (yes = yes)
+PASS  the killed batch left nothing in Silver (crash before its commit) (49998 = 49998)
+PASS  drain exit status (0 = 0)
+PASS  silver rows = distinct trip_id (zero duplicates) (100000 = 100000)
+PASS  silver rows = events sent (100000 = 100000)
+PASS  counters consumed = events sent (100000 = 100000)
+PASS  counters duplicates_dropped = 0 (the retry re-inserted every row) (0 = 0)
+PASS  bronze offset pairs = events sent (no event lost) (100000 = 100000)
+PASS  bronze duplication > 0 (the at-least-once happened) (49996 >= 1)
+PASS  bronze rows > events sent (149996 >= 100001)
+PASS  zone window sum = valid trips (98421 = 98421)
+
+bronze files: 24, null trip_id: 0
+bronze duplication measured: 49996 rows (the micro-batch the crash did not checkpoint)
+counter duplicates_dropped: 0 (only the events duplicated inside the replay itself)
+
+VERDICT: PASS — Silver is idempotent under kill -9; Bronze keeps the at-least-once write.
