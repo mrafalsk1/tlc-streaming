@@ -214,3 +214,53 @@ Contrato do Dia 6 (achado alto, corrigido no plano e na spec antes de implementa
 
 Risco latente: `FARE_CEILING` mora em `producer/schema.py`. O job do Dia 6 precisa importar do
 pacote (ou repetir o shim de `sys.path` do produtor) para o teto não virar segunda definição.
+
+## Dia 5 — Bronze
+
+Feito: `streaming/schema.py` (schema explícito amarrado a `producer.schema.EVENT_FIELDS`),
+`streaming/job.py` (Kafka → Parquet), `scripts/fetch_jars.py`, `scripts/count_bronze.py`, alvos
+`make jars/stream/bronze/bronze-reset`, 6 testes novos (27 no total).
+
+### Números medidos
+
+- 100k do tópico → **100.000 linhas, 18 arquivos Parquet, 0 `trip_id` nulo, 100.000 pares
+  `(kafka_partition, kafka_offset)` distintos**, ~15 s de ponta a ponta com JVM fria. São **3**
+  micro-lotes (49.998 + 49.996 + 6): o teto de 50k é dividido entre as 6 partições, então ele é
+  alvo, não tamanho exato de lote.
+- Segunda execução com o mesmo checkpoint: **0 linhas novas** (offset vem do checkpoint).
+- `rpk group describe spark-tlc-stream` → grupo existe, `TOTAL-LAG 0`, `MEMBERS 0` depois de parar.
+- Partição em UTC confirmada: `ingest_date=2026-11-26/hour=6` com o relógio local em 03:29 (UTC-3).
+
+### O que doeu
+
+- **Spark 4 usa Ivy 2.5.2 e o cache é `~/.ivy2.5.2/`**, não `~/.ivy2/`; o nome do jar também vem
+  achatado (`org.apache.spark_spark-sql-kafka-0-10_2.13-4.3.0.jar`). A primeira versão do
+  `fetch_jars.py` procurava `~/.ivy2/jars` e `startswith("spark-sql-kafka")`, então baixou tudo e
+  "não achou" nada. Agora o download usa um **Ivy dedicado** (`jars/.ivy`): os jars copiados são
+  exatamente os que o POM do conector resolveu, sem pegar a `kafka-clients` mais nova de outro
+  projeto da máquina — o plano B de varrer `~/.ivy2*` e escolher a maior versão tem esse risco e foi
+  descartado.
+- Só **4** artefatos faltam no `pyspark/jars`: `spark-sql-kafka`, `spark-token-provider-kafka`,
+  `kafka-clients` e `commons-pool2` (o Spark traz `commons-pool` 1.5.4, que não serve). Copiar os
+  11 resolvidos pelo Ivy duplicaria ~63 MB de hadoop/lz4/snappy que o Spark já tem.
+- `to_utc_timestamp(current_timestamp(), tz)` **não** devolve o instante em `tz`: ele lê o relógio
+  local da sessão como se fosse daquele fuso. Com sessão em NY e tz Kiritimati a partição saiu 18 h
+  errada — o teste pegou. Correção: sessão em UTC + `to_date`/`hour` direto, e
+  `add_ingest_columns` **falha** se a sessão não estiver em UTC em vez de gravar pasta errada.
+
+### Contrato para o Dia 6
+
+- Bronze guarda `event_time`/`dropoff_at` como **texto** (naive de NY): o cast para timestamp é do
+  Silver, com a sessão fixada no fuso de NY; não inferir fuso no ingest.
+- Bronze tem inválidos e atrasados de propósito; `is_valid_trip` e o filtro de atraso nascem no
+  Silver, não aqui.
+- `spark.sql.session.timeZone=UTC` é do job do Bronze. O job do Silver precisa de outro valor e não
+  deve reutilizar `add_ingest_columns` sem revisar a guarda.
+
+### Risco latente
+
+- `kafka.group.id` fixo faz o Spark avisar que é "unsafe": duas queries simultâneas com o mesmo
+  grupo brigam por partições. No lab há uma query só; o Dia 9 vai matar e subir de novo — por isso
+  `kafka.session.timeout.ms=10000` (default 45 s) para o coordenador liberar o consumidor morto
+  rápido. Se o restart ainda demorar, olhar isso antes de culpar o checkpoint.
+

@@ -10,6 +10,11 @@ DUPES ?= 0
 DIRTY ?= 0
 RAW_DIR ?= $(HOME)/projetos/tlc-elt/data/raw
 
+# Dia 5: job Spark → Bronze. `STREAM_ARGS="--available-now"` processa o que existe e encerra.
+JARS_DIR ?= jars
+STREAM_ARGS ?=
+BRONZE_ARGS ?=
+
 # Spark 4 não homologa o JDK 27 (default do repo): fixar o 21.
 # `:=` de propósito: um JAVA_HOME exportado no shell (archlinux-java, SDKMAN) não pode vencer em silêncio.
 JAVA_HOME := /usr/lib/jvm/java-21-openjdk
@@ -38,11 +43,11 @@ produce: ## Replay do TLC Parquet para trips.raw (RATE=500 LIMIT=20000; 0 = sem 
 	  test "$$parts" = "6" || { echo "topico $(TOPIC) com particoes=$${parts:-0} (esperado 6) — rode 'make topic'"; exit 1; }
 	@uv run python producer/producer.py --rate $(RATE) --limit $(LIMIT) --dupes $(DUPES) --dirty $(DIRTY) --topic $(TOPIC) --raw-dir $(RAW_DIR)
 
-test: ## Roda o pytest do producer (Dia 4)
+test: ## Roda o pytest do producer e do job de streaming (Dia 5)
 	@uv run pytest -q
 
-lint: ## ruff no código do producer e nos testes
-	@uv run ruff check producer tests
+lint: ## ruff no producer, no streaming e nos testes
+	@uv run ruff check producer streaming scripts tests
 
 venv: ## Cria a venv com Python 3.12 (uv lê .python-version; preserva a existente)
 	uv venv --python 3.12 --allow-existing
@@ -56,6 +61,19 @@ check-java: ## Falha cedo se o JDK 21 não estiver no lugar
 smoke: check-java ## Spark local sobe e conta 10, com o mesmo JAVA_HOME dos jobs
 	@uv run python -c "import pyspark; print('pyspark', pyspark.__version__)"
 	@uv run python -c "from pyspark.sql import SparkSession as S; s=S.builder.master('local[2]').appName('smoke').getOrCreate(); print('count', s.range(10).count(), '| java', s.sparkContext._jvm.System.getProperty('java.version')); s.stop()"
+
+jars: check-java ## Baixa o conector Kafka do Maven para jars/ (uma vez, com rede)
+	@uv run python scripts/fetch_jars.py --dest $(JARS_DIR)
+
+stream: check-java ## Consome trips.raw e grava o Bronze (Ctrl+C encerra; STREAM_ARGS=--available-now)
+	@uv run python -m streaming.job --jars-dir $(JARS_DIR) $(STREAM_ARGS)
+
+bronze: ## Conta o Bronze em Parquet (BRONZE_ARGS=--check conta nulos e offsets repetidos)
+	@uv run python scripts/count_bronze.py --dir data/bronze $(BRONZE_ARGS)
+
+bronze-reset: ## Apaga o Bronze e o checkpoint dele (só laboratório: refaz o Dia 5 do zero)
+	@rm -rf data/bronze data/checkpoints/bronze
+	@echo "bronze e checkpoint apagados"
 
 silver: ## Aplica o DDL do schema Silver no Postgres (idempotente)
 	@$(COMPOSE) ps --status running --services | grep -qx postgres || { echo "postgres parado — rode 'make up'"; exit 1; }
@@ -72,4 +90,4 @@ ps: ## Estado dos containers
 logs: ## Logs do Redpanda
 	@$(COMPOSE) logs -f redpanda
 
-.PHONY: help up down clean topic produce test lint venv deps check-java smoke silver silver-reset ps logs
+.PHONY: help up down clean topic produce test lint venv deps check-java smoke jars stream bronze bronze-reset silver silver-reset ps logs
