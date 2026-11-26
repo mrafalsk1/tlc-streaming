@@ -346,5 +346,84 @@ Cenário 100k + 50 duplicatas + 100 sujos, drenado em 3 lotes (49.997 + 49.998 +
   falhar para sempre no mesmo offset (e o Bronze ganharia um append por tentativa). Trocado por
   `try_to_timestamp`/`try_cast`; valor fora da faixa vira `NULL` e a linha é marcada inválida.
 
+## Janela por zona
 
+`silver.zone_demand_5min` (PK `pickup_zone_id, window_start`): `trips`, `revenue` e
+`avg_duration_min` por janela tumbling de 5 min, só `is_valid_trip = true` (a média de duração também
+exige `dropoff_at`). A janela é **recalculada** no Postgres, para as janelas que o lote tocou, lendo
+`silver.trip_events` — na mesma transação do upsert (`_WINDOW_SQL` em `streaming/silver.py`). Limites
+alinhados ao epoch (`date_bin`), o mesmo limite do `window()` do Spark porque 5 min divide a hora.
 
+### Desvio do plano
+
+O plano pedia agregação em Spark com `outputMode("update")` e watermark de 15 min. Trocado, e o
+motivo é mecânico: agregado só do lote não consegue ser correto **e** reexecutável ao mesmo tempo —
+substituir o valor apaga a contribuição dos lotes anteriores; somar conta duas vezes quando o
+checkpoint reexecuta o lote. Recalcular da fonte é idempotente por construção (reexecução reescreve
+os mesmos números) e resolve o evento atrasado aceito dentro da tolerância, que tem que atualizar a
+janela dele, não a do lote. O watermark do Spark deixa de existir: o filtro de atraso do Silver já é
+o único lugar onde atraso é decidido, e a janela herda isso. Custo aceito: duas varreduras por janela
+tocada (recálculo e checagem, ambas usando `trip_events_zone_pickup_idx`), sem estado crescente.
+
+### Números medidos
+
+Cenário 100k + 50 duplicatas + 100 sujos, drenado em 3 lotes:
+
+- **21.238 janelas**; `sum(trips) = 98.421 = count(*) where is_valid_trip` — a reconciliação fecha
+  (`make windows`).
+- 19 janelas tocadas ficaram com `trips = 0` (só linhas inválidas naquela zona/janela). Ficam na
+  tabela com zero de propósito: a reconciliação soma a tabela, então a linha não pode sumir.
+- Recálculo independente direto de `trip_events`: 21.219 janelas com linha válida, **0 divergências**
+  nas 21.219; as 19 restantes são exatamente as vazias. 0 janelas desalinhadas e
+  `window_end = window_start + 5 min` em todas.
+- **Replay completo** (checkpoint do Bronze apagado **e** `stream_state.watermark = NULL`): os
+  100.150 eventos passam como **100.150 duplicados**, `late=0`, nenhum insert; Silver, contadores e
+  janelas **idênticos** — `md5` igual antes e depois sobre
+  `(pickup_zone_id, window_start, window_end, trips, revenue, avg_duration_min)`; `updated_at` é
+  reescrito de propósito e **não serve** como marcador incremental para o Gold. Nenhuma linha nova em
+  `batch_runs`; `counters.json` só com `updated_at` novo.
+- Execução seguinte com o checkpoint no fim: **0 lote**.
+- `make windows-backfill` (reconstrução total): 21.219 janelas, `sum(trips)` e `revenue` idênticos e
+  reconciliação fechando. Ele não recria as 19 janelas vazias — não há como derivá-las de
+  `trip_events`; a soma é a mesma, o número de linhas não.
+- `revenue` total **3.057.192,10**; janela maior: zona 79, `02:40`, 58 corridas, `1.457,06`.
+
+### O que doeu
+
+- `LEFT JOIN` + `count(e.trip_id)`: com `count(*)` a janela vazia contaria 1 e a reconciliação
+  fecharia errada por 19 no cenário. O teste do SQL (transação revertida, 2.000 linhas) mostrou a
+  janela vazia antes do dreno — foi o que pegou.
+- `wsl -d archlinux -- bash -lc` com `||`, `$` e aspas: três tentativas de query inline viraram
+  erro de parsing. Script em `Temp` rodado via `/mnt/c/...` é o caminho que funciona.
+- **Replay com o watermark intacto não prova nada**: o primeiro replay depois do dreno deu
+  `late=49.997` no primeiro lote e `late=49.367` no segundo — o `stream_state.watermark` ficou no fim
+  do dado e o filtro descartou **99.364** eventos como atrasados. Os **786** dos últimos 10 min
+  passaram como duplicados (`631` + `155`), recalcularam as janelas deles e nada mudou — então esse
+  replay prova a armadilha e a idempotência, mas só nesses 786. O teste completo exige limpar o
+  watermark antes: aí os 100.150 entram como duplicados e o recálculo roda em todas as 21.238
+  janelas, com o mesmo `md5`. Fica a armadilha: `make bronze-reset` sozinho não é replay.
+
+### Revisão de código (o que mudou)
+
+Achados do revisor independente, aplicados:
+
+- **Lost update entre dois escritores (alto, reproduzido)**: o recálculo lê o agregado antes de
+  pegar o lock da linha da janela. Dois lotes na mesma janela (query reiniciada enquanto o consumidor
+  antigo morre, dois jobs no mesmo tópico) calculavam sobre snapshots que não se viam; o segundo
+  esperava o lock e gravava o número velho — `sum(trips) < count(*)` permanente. Correção:
+  `pg_advisory_xact_lock` antes do recálculo, na mesma transação. O lock cobre só o trabalho da
+  janela e de quebra tira o deadlock entre dois escritores; com um escritor, custo zero.
+- **Invariante sem asserção (médio)**: até aqui só o `make windows` conferia. Agora, antes do
+  commit, o lote compara `sum(trips)` das janelas tocadas com `count(*)` de válidas nas mesmas
+  janelas e levanta erro se divergir — a transação desfaz e o checkpoint repete o lote. Uma regressão
+  (trocar `count(e.trip_id)` por `count(*)`, perder o `is_valid_trip`) falha em vez de gravar errado.
+- **Sem reparo (médio)**: `scripts/backfill_windows.sql` + `make windows-backfill` reconstroem a
+  tabela inteira a partir de `trip_events` (restore parcial, tabela truncada à mão).
+- Documentação corrigida: `avg_duration_min` também exige `dropoff_at`; "mesma fronteira do
+  `window()`" vale porque 5 min divide a hora; `updated_at` é reescrito a cada recálculo e não é
+  marcador incremental; `make windows` entrou no bloco "Running it" e a tabela no diagrama.
+
+Riscos latentes documentados, não corrigidos: o recálculo só toca a janela **nova** — se um
+`trip_id` já gravado mudar de zona ou `pickup_at` (hoje impossível, o hash cobre os dois), a janela
+antiga fica com a contagem velha, e o backfill é a saída; e o `statement_timeout = '10min'` agora
+cobre também a varredura da janela (no lab, 0,09 s para 50k linhas contíguas / 10.442 janelas).

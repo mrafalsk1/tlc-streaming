@@ -5,8 +5,8 @@ events into Redpanda (Kafka API), Spark Structured Streaming validates and lands
 (Parquet) and a Silver layer (Postgres), and dbt models the Gold layer on top of Silver.
 
 **Status:** the producer, the Bronze layer and the Silver layer (validation, late filter, idempotent
-upsert) are running; dbt (Gold) and the metrics are next. Numbers and diagrams land as they are
-measured — nothing in this README is estimated.
+upsert, zone window) are running; dbt (Gold) and the metrics are next. Numbers and diagrams land as
+they are measured — nothing in this README is estimated.
 
 ```
 Parquet TLC
@@ -18,6 +18,7 @@ Redpanda  topic: trips.raw (6 partitions, key = pickup_zone_id, retention 24h)
 Spark Structured Streaming (10s trigger)                       ← implemented (explicit schema, checkpoint)
    ├─ Bronze: raw append Parquet  data/bronze/                 ← implemented
    └─ Silver (Postgres): validated, late-filtered, deduplicated by trip_id   ← implemented
+        └─ silver.zone_demand_5min: zone x 5-minute window                    ← implemented
    │
    ▼
 dbt (Gold) → fct_trips_stream, agg_zone_hourly, agg_payment_behavior
@@ -37,6 +38,8 @@ make stream  # Spark consumes trips.raw into Bronze and Silver (Ctrl+C stops; ST
 make bronze  # counts the Bronze with pyarrow, no JVM (BRONZE_ARGS=--check for nulls/repeated offsets)
 make counters     # incremental Silver counters (invalid / late / duplicates / rejected)
 make silver-stats # Silver row counts (rows, distinct trip_ids, invalid)
+make windows      # zone window totals + the reconciliation against the valid Silver rows
+make windows-backfill # rebuild zone_demand_5min from trip_events (repair; stop the job first)
 make test    # pytest of the producer and the streaming job
 make lint    # ruff on producer, streaming, scripts and tests
 make down    # keeps the volumes
@@ -82,6 +85,13 @@ The per-batch result is written to `silver.batch_runs` in the same transaction, 
 offset ranges. A batch replayed by the checkpoint is a no-op there, so the counters never count the
 same work twice; `data/state/counters.json` is the sum of that table.
 
+The watermark lives in the database, not in the checkpoint. Deleting the Bronze checkpoint alone
+replays the topic from its beginning against a watermark at the end of the data: the filter keeps
+only the last 10 minutes of the data and drops the rest as late (measured: 99,364 `late_dropped` and
+786 events re-entered as duplicates). A replay is only meaningful after clearing
+`silver.stream_state.watermark`; then all 100,150 events land as `duplicates_dropped` and nothing in
+Silver moves.
+
 Measured on the same replay:
 
 | Counter | Value |
@@ -97,11 +107,40 @@ Measured on the same replay:
 invalid TLC rows plus the 100 injected dirty events. `silver.trip_events` ends with **100,100 rows
 and 100,100 distinct `trip_id`** — the 50 duplicates never became rows — and a second run with the
 same checkpoint changes neither Bronze, Silver nor the counters. A re-run with a fresh Bronze
-checkpoint replays the same offsets: Bronze doubles by design (at-least-once), while Silver and
-the counters stay unchanged — the ledger absorbs the replay. Timestamps keep their contract:
-`pickup_at` is the naive New York wall clock (min `2002-12-31 22:59:39`, the TLC outlier; max
-`2024-01-02 11:02:23`); `lag_seconds` is `ingested_at - emit_time` and depends on the backlog of the
-run, so the steady-state latency numbers come with the metrics, not from this drain.
+checkpoint replays the same offsets: Bronze doubles by design (at-least-once), while Silver, the
+counters and the zone windows stay unchanged — the ledger absorbs the replay. Timestamps keep their
+contract: `pickup_at` is the naive New York wall clock (min `2002-12-31 22:59:39`, the TLC outlier;
+max `2024-01-02 11:02:23`); `lag_seconds` is `ingested_at - emit_time` and depends on the backlog of
+the run, so the steady-state latency numbers come with the metrics, not from this drain.
+
+## Zone window
+
+`silver.zone_demand_5min` keeps one row per `(pickup_zone_id, 5-minute window)` with `trips`,
+`revenue` and `avg_duration_min`, valid trips only (`avg_duration_min` also needs a dropoff time).
+Boundaries are aligned to the epoch (`date_bin`; the same boundary Spark's `window()` uses, because 5
+minutes divides the hour). The batch does not aggregate the events it received: in the same
+transaction as the upsert it **recomputes the windows it touched**, reading `silver.trip_events`. A
+batch-local aggregate cannot be both correct and retry-safe — replacing a window's value erases the
+previous batches, adding to it counts the events twice when the checkpoint replays the batch.
+Recomputing from the source makes a replay a rewrite of the same numbers and lets a late event inside
+the tolerance update the window it belongs to.
+
+Two guards come with it. The window work runs under a transaction-level advisory lock: two writers
+on the same window would otherwise compute the aggregate on a snapshot that does not see each other,
+wait for the row lock and commit the stale number (reproduced with two transactions). And before the
+commit the batch asserts that the sum of the touched windows equals the valid trips in them, so a
+regression fails the batch instead of writing a wrong reconciliation. `make windows-backfill`
+rebuilds the whole table from `trip_events` when a partial restore left windows behind; it produces
+only windows with valid trips, while the stream also keeps a touched window that ended empty as a
+`trips = 0` row — the row count can differ, the sum does not.
+
+Measured on the 100k replay: **21,238 windows, `sum(trips) = 98,421 = count(*) where
+is_valid_trip`**, no misaligned boundary. 19 touched windows have zero valid rows and stay at 0, so
+the sum still closes. An independent recomputation straight from `trip_events` matched all 21,219
+non-empty windows. A full replay (fresh checkpoint and a cleared watermark) left Silver, the counters
+and every aggregate column of the windows unchanged (`md5` over `pickup_zone_id, window_start,
+window_end, trips, revenue, avg_duration_min` identical; `updated_at` is rewritten by design and is
+not an incremental marker). `make windows` runs the reconciliation.
 
 ## Design decisions
 
@@ -112,9 +151,10 @@ run, so the steady-state latency numbers come with the metrics, not from this dr
 | At-least-once + idempotent upsert | easy to prove; real exactly-once needs distributed transactions | replays are possible; the idempotency lives in the destination |
 | Two timestamps: `event_time` (pickup) + `emit_time` (send) | the replay is historical, so pickup time cannot measure pipeline latency | producer must replay in chronological order |
 | No Spark stateful dedup | 9.5M keys would grow the state store forever | dedup is the `PRIMARY KEY (trip_id)` upsert |
-| Job-decided late filter | `late_dropped` is exact by construction; the Spark watermark stays only in the window | one more component to maintain |
+| Job-decided late filter | `late_dropped` is exact by construction; the zone window inherits the same filter, with no Spark watermark to maintain | one more component to maintain |
 | Watermark = lowest per-partition `max(event_time)` | in a zone-keyed replay the partitions advance at different event-time rates, so the global max would drop in-order rows | the watermark moves at the slowest partition's pace |
 | Counters in a DB ledger (`silver.batch_runs`) | a batch replayed by the checkpoint does not count twice; the JSON is derived from the table | one more table to keep in the DDL |
+| Zone window recomputed from `trip_events` | a batch-local aggregate is neither retry-safe nor late-tolerant: replace erases the earlier batches, add counts twice on a replay | two scans per touched window (write and check), per batch; a transaction-level advisory lock serializes the window work |
 | `try_to_timestamp`/`try_cast` on the Silver side | Spark 4 has ANSI on: one malformed timestamp or out-of-range amount would abort every retry of the batch | the bad value becomes NULL (and the row is flagged or rejected) instead of failing |
 | Bronze keeps `event_time`/`dropoff_at` as text | the TLC timestamp is naive New York time; casting at ingest would pick a timezone silently | Silver must cast before windowing |
 | Fixed consumer group id (`spark-tlc-stream`) | consumer lag per partition is read with `rpk group describe` | a killed query can collide with its dying consumer, so session timeout is dropped to 10 s |

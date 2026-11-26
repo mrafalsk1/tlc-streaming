@@ -40,6 +40,8 @@ CREATE INDEX IF NOT EXISTS trip_events_zone_pickup_idx
     ON silver.trip_events (pickup_zone_id, pickup_at);
 
 -- Zone x 5-minute tumbling window. Composite PK = the window upsert key.
+-- The aggregate is recomputed from trip_events for the windows a batch touched (streaming/silver.py):
+-- a replayed batch rewrites the same numbers instead of counting the events twice.
 CREATE TABLE IF NOT EXISTS silver.zone_demand_5min (
     pickup_zone_id   INTEGER       NOT NULL,
     window_start     TIMESTAMP     NOT NULL,

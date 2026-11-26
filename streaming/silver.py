@@ -4,7 +4,7 @@ Bronze accepts everything; this is where the event is classified. The order is t
 (docs/notes.md): validation → late filter → upsert. Deduplication is **not** stateful: the Postgres
 `PRIMARY KEY (trip_id)` does it, so the Spark state does not grow with the stream.
 
-Five decisions that are not obvious:
+Six decisions that are not obvious:
 
 * **Watermark from the previous batch, per partition.** The filter reads
   `silver.stream_state.watermark`, written by the previous batch, and only then writes this batch's
@@ -34,6 +34,16 @@ Five decisions that are not obvious:
   JSON) is invalid but has no PK; null `pickup_at`/`emit_time` violate `NOT NULL`; a `trip_id` with
   NUL cannot cross the COPY (psycopg refuses it, even though it escapes TAB/newline). Those cases
   count as `rejected` and stay in Bronze.
+* **The zone window is recomputed from the table, not aggregated from the batch.** The aggregates in
+  `silver.zone_demand_5min` are recomputed (same transaction) for the windows the batch touched,
+  counting `silver.trip_events` rows. A batch-local aggregate in Spark cannot be both correct and
+  retry-safe: replacing a window's value erases the previous batches, and adding to it counts twice
+  when the checkpoint replays the batch. Recomputing from the source makes a replay a rewrite of the
+  same numbers and lets a late event inside the tolerance (which lands in an old window) update the
+  window it belongs to. The cost is two scans per touched window (the recompute and the check), not
+  a growing state store. A transaction-level advisory lock serializes the window work between
+  writers, and the batch asserts `sum(trips) == count(valid trips)` for the windows it touched before
+  committing.
 """
 
 from __future__ import annotations
@@ -133,6 +143,77 @@ ON CONFLICT (trip_id) DO UPDATE SET
     ingested_at     = EXCLUDED.ingested_at,
     lag_seconds     = EXCLUDED.lag_seconds
 RETURNING (xmax = 0) AS inserted, is_valid_trip
+"""
+
+# Zone x 5-minute window, recomputed for the windows this batch touched. Tumbling boundaries are
+# aligned to the epoch (`date_bin`, the same boundary Spark's `window()` uses because 5 min divides
+# the hour), so a window never drifts between batches. `LEFT JOIN` keeps a touched window that ended
+# with zero valid rows at `trips = 0` instead of leaving the old value behind. The aggregate reads
+# `trip_events`, never the staging rows: see the last decision of the module.
+#
+# The window set is shared by the recompute and the assertion below, so the two cannot drift.
+_TOUCHED_WINDOWS_SQL = f"""
+touched AS (
+    SELECT DISTINCT
+        pickup_zone_id,
+        date_bin('5 minutes', pickup_at, TIMESTAMP '2000-01-01 00:00:00') AS window_start
+    FROM {_STAGING}
+    WHERE pickup_zone_id IS NOT NULL AND pickup_at IS NOT NULL
+)
+"""
+
+_WINDOW_SQL = f"""
+WITH {_TOUCHED_WINDOWS_SQL}
+INSERT INTO silver.zone_demand_5min
+    (pickup_zone_id, window_start, window_end, trips, revenue, avg_duration_min, updated_at)
+SELECT
+    t.pickup_zone_id,
+    t.window_start,
+    t.window_start + interval '5 minutes',
+    count(e.trip_id),
+    COALESCE(sum(e.total_amount), 0),
+    avg(extract(epoch FROM (e.dropoff_at - e.pickup_at)) / 60.0)
+        FILTER (WHERE e.dropoff_at IS NOT NULL),
+    now()
+FROM touched t
+LEFT JOIN silver.trip_events e
+    ON  e.pickup_zone_id = t.pickup_zone_id
+    AND e.pickup_at >= t.window_start
+    AND e.pickup_at <  t.window_start + interval '5 minutes'
+    AND e.is_valid_trip
+GROUP BY t.pickup_zone_id, t.window_start
+ON CONFLICT (pickup_zone_id, window_start) DO UPDATE SET
+    window_end       = EXCLUDED.window_end,
+    trips            = EXCLUDED.trips,
+    revenue          = EXCLUDED.revenue,
+    avg_duration_min = EXCLUDED.avg_duration_min,
+    updated_at       = EXCLUDED.updated_at
+"""
+
+# The window read and the window write must not interleave with another writer. Taken at transaction
+# level, right before the recompute: a second batch would otherwise read the aggregate from a
+# snapshot that does not see the other transaction, wait for the row lock and commit the stale
+# number. It also keeps two batches from taking the window rows in opposite orders (deadlock).
+_WINDOW_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('silver.zone_demand_5min'))"
+
+# The invariant of the window table, asserted before the commit: the sum of the touched windows must
+# be the number of valid trips in them. A bug here would silently break the reconciliation, so the
+# batch fails loudly (and the checkpoint replays it) instead of committing wrong numbers.
+_CHECK_WINDOW_SQL = f"""
+WITH {_TOUCHED_WINDOWS_SQL}
+SELECT
+    (SELECT COALESCE(sum(z.trips), 0)
+       FROM touched t
+       JOIN silver.zone_demand_5min z
+         ON z.pickup_zone_id = t.pickup_zone_id
+        AND z.window_start = t.window_start) AS window_trips,
+    (SELECT count(*)
+       FROM touched t
+       JOIN silver.trip_events e
+         ON e.pickup_zone_id = t.pickup_zone_id
+        AND e.pickup_at >= t.window_start
+        AND e.pickup_at <  t.window_start + interval '5 minutes'
+      WHERE e.is_valid_trip) AS valid_trips
 """
 
 _INSERT_BATCH_RUN_SQL = """
@@ -329,9 +410,10 @@ def process_batch(
 ) -> BatchResult:
     """Validate, filter late events and upsert one micro-batch; return what was done.
 
-    Everything in one transaction: if the upsert, the ledger or the watermark update fails, the batch
-    is repeated by the checkpoint with the old watermark, and the filter decides the same as it would
-    on the first attempt. The `silver.batch_runs` PK keeps the repetition from counting twice.
+    Everything in one transaction: if the upsert, the ledger, the watermark update or the window
+    recompute fails, the batch is repeated by the checkpoint with the old watermark, and the filter
+    decides the same as it would on the first attempt. The `silver.batch_runs` PK keeps the
+    repetition from counting twice.
     """
     prepared = to_silver_events(batch).persist()
     try:
@@ -392,6 +474,18 @@ def process_batch(
                             raise RuntimeError(
                                 f"batch {batch_id}: DISTINCT ON returned {len(returned)} rows "
                                 f"for {distinct_ids} distinct trip_id"
+                            )
+
+                        # The window work runs under the lock; the read must see every writer that
+                        # committed before it.
+                        cur.execute(_WINDOW_LOCK_SQL)
+                        cur.execute(_WINDOW_SQL)
+                        cur.execute(_CHECK_WINDOW_SQL)
+                        window_trips, valid_trips = cur.fetchone()
+                        if window_trips != valid_trips:
+                            raise RuntimeError(
+                                f"batch {batch_id}: windows sum {window_trips} != "
+                                f"{valid_trips} valid trips in the touched windows"
                             )
 
                     cur.execute(_INSERT_BATCH_RUN_SQL, {"batch_key": batch_key, **asdict(result)})

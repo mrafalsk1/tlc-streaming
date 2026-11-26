@@ -90,6 +90,14 @@ silver-reset: ## DROP + recreate the Silver (lab only: the schema is frozen afte
 silver-stats: ## Silver counts (rows, distinct trip_ids and invalid)
 	@$(COMPOSE) exec -T postgres psql -U stream -d streaming -c "SELECT count(*) AS rows, count(DISTINCT trip_id) AS distinct_ids, count(*) FILTER (WHERE NOT is_valid_trip) AS invalid FROM silver.trip_events"
 
+windows: ## Zone x 5-min table and its reconciliation against the valid Silver rows
+	@$(COMPOSE) exec -T postgres psql -U stream -d streaming -c "SELECT count(*) AS windows, sum(trips) AS trips, sum(revenue)::numeric(12,2) AS revenue FROM silver.zone_demand_5min"
+	@$(COMPOSE) exec -T postgres psql -U stream -d streaming -c "SELECT (SELECT coalesce(sum(trips), 0) FROM silver.zone_demand_5min) AS window_trips, (SELECT count(*) FROM silver.trip_events WHERE is_valid_trip) AS valid_trips, (SELECT coalesce(sum(trips), 0) FROM silver.zone_demand_5min) = (SELECT count(*) FROM silver.trip_events WHERE is_valid_trip) AS reconciled"
+
+windows-backfill: ## Rebuild zone_demand_5min from trip_events (repair; stop the job first)
+	@$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -U stream -d streaming < scripts/backfill_windows.sql
+	@$(MAKE) --no-print-directory windows
+
 counters: ## Show the incremental Silver counters
 	@test -f data/state/counters.json && uv run python -m json.tool data/state/counters.json || echo "no counters yet"
 
@@ -99,4 +107,4 @@ ps: ## Container status
 logs: ## Redpanda logs
 	@$(COMPOSE) logs -f redpanda
 
-.PHONY: help up down clean topic produce test lint venv deps check-java smoke jars stream bronze bronze-reset silver silver-reset silver-stats counters ps logs
+.PHONY: help up down clean topic produce test lint venv deps check-java smoke jars stream bronze bronze-reset silver silver-reset silver-stats windows windows-backfill counters ps logs
