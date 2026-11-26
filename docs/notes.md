@@ -51,8 +51,8 @@ Cheques verdes:
 
 - `uv run ruff check producer` → `All checks passed!`.
 - `uv run python producer/producer.py --rate 500 --limit 20000` → **20.000 enviados, 0 ignorados,
-  0 falhas de entrega em 40,0 s = 500 ev/s** (relógio do shell: 40,28 s). Depois da revisão
-  independente, o mesmo aceite dá **40,5 s = 494 ev/s** — a diferença é a leitura/ordenação do mês
+  0 falhas de entrega em 40,0 s = 500 ev/s** (relógio do shell: 40,28 s). Depois da revisão de
+  código, a mesma medição dá **40,5 s = 494 ev/s** — a diferença é a leitura/ordenação do mês
   (~0,4 s) que passou a ficar fora da âncora do ritmo; o log de janela fica em 500 ev/s.
 - Sem freio (`--rate 0`) a mesma leitura sai a **~4.100 ev/s** (2.000 eventos em 0,5 s, já incluindo a
   ordenação do mês inteiro) — teto do produtor (confirmado abaixo com 100k).
@@ -83,7 +83,7 @@ com `producer/__init__.py` mais uma linha que põe a raiz do repo no `sys.path` 
 Também: `# noqa: E402` no import foi acusado pelo ruff (`RUF100`, regra não habilitada no default);
 o import ficou sem `noqa`.
 
-### Revisão independente (o que mudou)
+### Revisão de código (o que mudou)
 
 Aplicado:
 
@@ -110,7 +110,7 @@ Descartado, com motivo:
 - **`EVENT_FIELDS` divergir do dict**: vira teste (`tuple(event) == EVENT_FIELDS`), que é
   onde a checagem paga; em runtime seria custo por evento.
 
-Follow-up da revisão (mesmo revisor), aplicado:
+Ajustes complementares aplicados:
 
 - **Rajada na fronteira de mês**: a âncora do `--rate` é zerada a cada arquivo, então a
   leitura/ordenação do mês seguinte não entra como crédito de ritmo.
@@ -178,7 +178,7 @@ deu 1.100 — duplicata repete id, então 1.000 reais + 100 sujos = 1.100; corri
 primeira versão do `--dirty` injetava no máximo um sujo por evento real: com `--limit 3 --dirty 4`
 saíam 3; o teste de contagem pegou, e agora a sobra é injetada ao final.
 
-### Revisão independente (o que mudou)
+### Revisão de código (o que mudou)
 
 Aplicado:
 
