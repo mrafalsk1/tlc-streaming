@@ -64,4 +64,18 @@ CREATE TABLE IF NOT EXISTS silver.stream_state (
 INSERT INTO silver.stream_state (id) VALUES (1)
 ON CONFLICT (id) DO NOTHING;
 
+-- Livro-caixa dos micro-lotes. A PK é a identidade do lote (faixas de offset por partição), que se
+-- repete quando o checkpoint reexecuta o lote: o INSERT ... ON CONFLICT DO NOTHING faz a repetição
+-- não somar duas vezes. `data/state/counters.json` é a soma desta tabela, não do processo.
+CREATE TABLE IF NOT EXISTS silver.batch_runs (
+    batch_key          TEXT PRIMARY KEY,
+    consumed           INTEGER     NOT NULL,
+    valid_stored       INTEGER     NOT NULL,
+    invalid            INTEGER     NOT NULL,
+    late_dropped       INTEGER     NOT NULL,
+    duplicates_dropped INTEGER     NOT NULL,
+    rejected           INTEGER     NOT NULL,
+    committed_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 COMMIT;

@@ -198,9 +198,10 @@ Aplicado:
 
 Contrato do Silver (achado alto, corrigido antes de implementar):
 
-1. As **quatro** regras de invalidez são as do schema Silver: `trip_id` nulo, `pickup_zone_id` nulo,
-   `trip_duration <= 0`, `fare_amount < 0` e `total_amount > 10.000`. A primeira versão do contrato
-   listava só três;
+1. As **cinco** regras de invalidez são as do schema Silver: `trip_id` nulo, `pickup_zone_id` nulo,
+   `trip_duration <= 0`, `fare_amount < 0` e `total_amount > 10.000`. Além delas, valor que não cabe
+   no `NUMERIC(10,2)` vira `NULL` no cast e a linha nasce inválida — perder a tarifa no caminho e
+   gravar a linha como válida seria mentira. A primeira versão do contrato listava só três;
    sem zona nula e teto, metade dos sujos entraria como válida (`invalid` cairia para 50 + 1.579).
 2. **Ordem**: validação → filtro de atraso → upsert (dedup no destino). Os contadores saem do
    resultado do upsert: `invalid` = linhas gravadas com `is_valid_trip = false`, `duplicates_dropped`
@@ -287,6 +288,10 @@ Cenário 100k + 50 duplicatas + 100 sujos, drenado em 3 lotes (49.997 + 49.998 +
 - Bronze: **100.150 linhas, 18 arquivos, 0 `trip_id` nulo, 100.150 pares
   `(kafka_partition, kafka_offset)` distintos**.
 - Segunda execução com o mesmo checkpoint: 0 lote — Bronze, Silver e contadores inalterados.
+- **Reexecução com o checkpoint do Bronze apagado** (mesmo tópico, 100.150 eventos): o Bronze
+  dobra (200.300 linhas, 100.150 pares `(partition, offset)` repetidos — at-least-once), o Silver
+  fica em 100.100 e os contadores **não somam de novo**: `silver.batch_runs` continua com 3 linhas
+  e os mesmos totais; o `counters.json` só muda o `updated_at`.
 - `pickup_at` sem deslocamento: mínimo `2002-12-31 22:59:39` (outlier do TLC) e máximo
   `2024-01-02 11:02:23`. `lag_seconds` (emit → ingest) varia com o backlog do dreno; não é medida
   de latência de regime, que fica para o `metrics.py`.
@@ -301,15 +306,24 @@ Cenário 100k + 50 duplicatas + 100 sujos, drenado em 3 lotes (49.997 + 49.998 +
    estava em `07:59` e a partição 5 em `13:42` (~6 h de diferença). Com o **máximo global**, um dreno
    de 50k por lote marcou **9.014 linhas** como `late_dropped` sem nenhuma estar atrasada. O menor
    máximo é o ponto até onde todos os inputs avançaram; dentro de cada partição a ordem é preservada
-   pelo producer, então não há falso positivo, e o resultado é o mesmo com lote de 8k ou 50k.
-2. **Contadores saem do upsert**: `RETURNING (xmax = 0)` separa insert de update; `invalid` = insert
-   com flag falsa e `duplicates_dropped` = linha do COPY que não virou insert (duplicata dentro do
-   lote ou conflito com linha existente). Duplicata de inválido conta só como duplicata.
+   pelo producer, então não há falso positivo. Consequência honesta: a tolerância efetiva é o span de
+   event-time do lote anterior + 10 min, então num lote largo um atraso real só é pego quando o
+   watermark passa dele — `late_dropped` fecha a conta, mas não promete pegar todo fora de ordem.
+   Limitação conhecida: o watermark considera só as partições presentes no lote; uma partição sem
+   tráfego por vários lotes (e que volta com evento antigo) não está representada. No TLC todas as
+   zonas têm tráfego contínuo.
+2. **Contadores saem do upsert, num livro-caixa no banco**: `RETURNING (xmax = 0)` separa insert de
+   update; `invalid` = insert com flag falsa e `duplicates_dropped` = linha do COPY que não virou
+   insert (duplicata dentro do lote ou conflito com linha existente). Duplicata de inválido conta só
+   como duplicata. O resultado vai para `silver.batch_runs` na **mesma transação**, com PK nas faixas
+   de offset do lote: um lote reexecutado pelo checkpoint não soma duas vezes, e
+   `data/state/counters.json` é a soma da tabela, não do processo.
 3. **`DISTINCT ON (trip_id)` antes do `INSERT`**: `ON CONFLICT DO UPDATE` recusa afetar a mesma
    linha duas vezes na mesma instrução; a duplicata que chega no mesmo micro-lote precisa ser
    colapsada antes.
 4. **`trip_id` nulo não entra**: a PK não aceita nulo, então a linha vai para `rejected` (e continua
-   no Bronze). O mesmo para `pickup_at` nulo (`NOT NULL`). Nenhum dos dois apareceu no cenário.
+   no Bronze). O mesmo para `pickup_at`/`emit_time` nulos (`NOT NULL`) e `trip_id` com NUL (o psycopg
+   recusa 0x00 no COPY; TAB e quebra de linha ele escapa). Nenhum desses apareceu no cenário.
 5. **COPY para tabela temporária** em vez de `execute_values` (não existe mais no psycopg 3.3):
    `CREATE TEMP TABLE ... ON COMMIT DROP` + COPY + `INSERT ... SELECT`. A transação inteira
    (watermark lido, upsert, watermark gravado) é um commit só: lote repetido pelo checkpoint vê o
@@ -327,5 +341,10 @@ Cenário 100k + 50 duplicatas + 100 sujos, drenado em 3 lotes (49.997 + 49.998 +
   no outro, todas em ordem. A causa não era o dado, era o watermark global contra partições
   desalinhadas em event-time. O probe por partição no Bronze (`min/max` e `event_time` em offsets
   redondos) foi o que mostrou a diferença de ~6 h entre fatias.
+- **ANSI ligado por padrão no Spark 4**: `to_timestamp('nao-e-data')` e `cast` de `1e20` para
+  `decimal(10,2)` **levantam exceção** em vez de devolver nulo. Um único registro ruim faria o lote
+  falhar para sempre no mesmo offset (e o Bronze ganharia um append por tentativa). Trocado por
+  `try_to_timestamp`/`try_cast`; valor fora da faixa vira `NULL` e a linha é marcada inválida.
+
 
 

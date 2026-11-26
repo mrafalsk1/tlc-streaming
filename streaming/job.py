@@ -75,7 +75,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="processa o que já existe no tópico (todos os lotes) e encerra",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.max_offsets_per_trigger <= 0:
+        parser.error(
+            "--max-offsets-per-trigger deve ser positivo: o Silver coleta o lote no driver, "
+            "e um teto ilimitado vira OOM (0 = sem teto no Spark)"
+        )
+    return args
 
 
 def jar_list(jars_dir: Path) -> list[str]:
@@ -219,7 +225,7 @@ def run(args: argparse.Namespace) -> int:
 
     print(
         f"bronze em {args.bronze_dir} | checkpoint {args.checkpoint_dir} | "
-        f"silver {'off (--bronze-only)' if args.bronze_only else args.dsn}",
+        f"silver {'off (--bronze-only)' if args.bronze_only else 'on'}",
         flush=True,
     )
     query = writer.start()

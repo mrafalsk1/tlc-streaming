@@ -85,6 +85,7 @@ silver-reset: ## DROP + recria o Silver (só laboratório: o schema é congelado
 	@$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -U stream -d streaming -c 'DROP SCHEMA IF EXISTS silver CASCADE'
 	@$(MAKE) --no-print-directory silver
 	@rm -f data/state/counters.json
+	@test ! -d data/checkpoints/bronze || echo "aviso: checkpoint do Bronze intacto — rode 'make bronze-reset' para reprocessar"
 
 silver-stats: ## Contagem do Silver (linhas, trip_id distintos e inválidos)
 	@$(COMPOSE) exec -T postgres psql -U stream -d streaming -c "SELECT count(*) AS rows, count(DISTINCT trip_id) AS distinct_ids, count(*) FILTER (WHERE NOT is_valid_trip) AS invalid FROM silver.trip_events"

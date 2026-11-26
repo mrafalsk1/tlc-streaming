@@ -64,15 +64,23 @@ come from the checkpoint, not from the start of the topic.
 
 The Silver branch runs in the same `foreachBatch`, after the Parquet write: validation, late filter
 and upsert into Postgres 5434. An invalid event is **stored** with `is_valid_trip = false` (it is
-data, not noise); only a row without `trip_id` or `pickup_at` cannot enter (no key, no `NOT NULL`
-value) and is counted as `rejected`. Deduplication is the `PRIMARY KEY (trip_id)` upsert — no Spark
-state grows with the stream.
+data, not noise); only a row without `trip_id`, `pickup_at` or `emit_time` (PK / `NOT NULL`) — or
+with a NUL in the id, which the COPY cannot carry — is counted as `rejected`.
+Deduplication is the `PRIMARY KEY (trip_id)` upsert — no Spark state grows with the stream.
 
 The late filter compares `event_time` with the watermark of the previous batch, which is the
 **lowest** of the per-partition `max(event_time)` values. The replay is keyed by zone and the offset
 cap is split across partitions, so they advance at different event-time rates (in an 8k batch, slice
 ends differed by ~6 h); the global maximum would mark in-order rows from the slower partitions as
-late. The lowest maximum is the point every input has passed.
+late. The lowest maximum is the point every input has passed. The effective tolerance is therefore
+the previous batch's event-time span plus 10 minutes: with a wide batch, a genuinely late event is
+only classified once the watermark has passed it — `late_dropped` is exact in the accounting, not a
+promise that every out-of-order event is dropped. The limit of this single-row state is the silent
+partition: a partition with no traffic for several batches is not represented in the watermark.
+
+The per-batch result is written to `silver.batch_runs` in the same transaction, keyed by the batch's
+offset ranges. A batch replayed by the checkpoint is a no-op there, so the counters never count the
+same work twice; `data/state/counters.json` is the sum of that table.
 
 Measured on the same replay:
 
@@ -88,7 +96,9 @@ Measured on the same replay:
 `98,421 + 1,679 + 0 + 50 = 100,150`: the reconciliation closes. `invalid` is 1,579 naturally
 invalid TLC rows plus the 100 injected dirty events. `silver.trip_events` ends with **100,100 rows
 and 100,100 distinct `trip_id`** — the 50 duplicates never became rows — and a second run with the
-same checkpoint changes neither Bronze, Silver nor the counters. Timestamps keep their contract:
+same checkpoint changes neither Bronze, Silver nor the counters. A re-run with a fresh Bronze
+checkpoint replays the same offsets: Bronze doubles by design (at-least-once), while Silver and
+the counters stay unchanged — the ledger absorbs the replay. Timestamps keep their contract:
 `pickup_at` is the naive New York wall clock (min `2002-12-31 22:59:39`, the TLC outlier; max
 `2024-01-02 11:02:23`); `lag_seconds` is `ingested_at - emit_time` and depends on the backlog of the
 run, so the steady-state latency numbers come with the metrics, not from this drain.
@@ -104,6 +114,8 @@ run, so the steady-state latency numbers come with the metrics, not from this dr
 | No Spark stateful dedup | 9.5M keys would grow the state store forever | dedup is the `PRIMARY KEY (trip_id)` upsert |
 | Job-decided late filter | `late_dropped` is exact by construction; the Spark watermark stays only in the window | one more component to maintain |
 | Watermark = lowest per-partition `max(event_time)` | in a zone-keyed replay the partitions advance at different event-time rates, so the global max would drop in-order rows | the watermark moves at the slowest partition's pace |
+| Counters in a DB ledger (`silver.batch_runs`) | a batch replayed by the checkpoint does not count twice; the JSON is derived from the table | one more table to keep in the DDL |
+| `try_to_timestamp`/`try_cast` on the Silver side | Spark 4 has ANSI on: one malformed timestamp or out-of-range amount would abort every retry of the batch | the bad value becomes NULL (and the row is flagged or rejected) instead of failing |
 | Bronze keeps `event_time`/`dropoff_at` as text | the TLC timestamp is naive New York time; casting at ingest would pick a timezone silently | Silver must cast before windowing |
 | Fixed consumer group id (`spark-tlc-stream`) | consumer lag per partition is read with `rpk group describe` | a killed query can collide with its dying consumer, so session timeout is dropped to 10 s |
 
