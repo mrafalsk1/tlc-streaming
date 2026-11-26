@@ -3,8 +3,11 @@ COMPOSE := docker compose
 TOPIC ?= trips.raw
 
 # Replay de amostra (Dia 3). Run completo: `make produce RATE=0 LIMIT=0`.
+# DUPES/DIRTY injetam duplicatas e eventos inválidos (Dia 6): `make produce DUPES=50 DIRTY=100`.
 RATE ?= 500
 LIMIT ?= 20000
+DUPES ?= 0
+DIRTY ?= 0
 RAW_DIR ?= $(HOME)/projetos/tlc-elt/data/raw
 
 # Spark 4 não homologa o JDK 27 (default do repo): fixar o 21.
@@ -33,7 +36,13 @@ produce: ## Replay do TLC Parquet para trips.raw (RATE=500 LIMIT=20000; 0 = sem 
 	@$(COMPOSE) exec -T redpanda rpk cluster info >/dev/null 2>&1 || { echo "redpanda fora do ar — rode 'make up'"; exit 1; }
 	@parts=$$($(COMPOSE) exec -T redpanda rpk topic describe $(TOPIC) 2>/dev/null | awk '$$1 == "PARTITIONS" {print $$2}'); \
 	  test "$$parts" = "6" || { echo "topico $(TOPIC) com particoes=$${parts:-0} (esperado 6) — rode 'make topic'"; exit 1; }
-	@uv run python producer/producer.py --rate $(RATE) --limit $(LIMIT) --topic $(TOPIC) --raw-dir $(RAW_DIR)
+	@uv run python producer/producer.py --rate $(RATE) --limit $(LIMIT) --dupes $(DUPES) --dirty $(DIRTY) --topic $(TOPIC) --raw-dir $(RAW_DIR)
+
+test: ## Roda o pytest do producer (Dia 4)
+	@uv run pytest -q
+
+lint: ## ruff no código do producer e nos testes
+	@uv run ruff check producer tests
 
 venv: ## Cria a venv com Python 3.12 (uv lê .python-version; preserva a existente)
 	uv venv --python 3.12 --allow-existing
@@ -63,4 +72,4 @@ ps: ## Estado dos containers
 logs: ## Logs do Redpanda
 	@$(COMPOSE) logs -f redpanda
 
-.PHONY: help up down clean topic produce venv deps check-java smoke silver silver-reset ps logs
+.PHONY: help up down clean topic produce test lint venv deps check-java smoke silver silver-reset ps logs

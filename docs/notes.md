@@ -133,3 +133,84 @@ A provar no Dia 5, antes de o Silver gravar:
   todos os arquivos, mas um lote todo nulo inferiria outro tipo e o append no Bronze conflitaria.
 - Key `unknown` é só transporte (o payload tem `pickup_zone_id`); não fazer `cast(key AS int)`.
 - `trip_id` usa `total_amount` formatado em `%.2f`: corrida com mais casas colidiria no PK do Silver.
+
+## Dia 4 — testes, injeção e teto de throughput (25/11/2026)
+
+`tests/test_schema.py` (contrato do evento) e `tests/test_producer.py` (ordenação, ritmo, flags e
+contabilidade), com `pytest.ini` (`pythonpath = .` — sem isso o pytest só põe `tests/` no
+`sys.path` e `import producer` falha).
+
+Cheques verdes:
+
+- `uv run pytest -q` → **16 passed** em 0,42 s.
+- `uv run ruff check producer tests` → `All checks passed!`.
+- Injeção ao vivo em `trips.smoke` (1.000 reais + 50 duplicatas + 100 sujos, tópico apagado depois):
+  **1.150 mensagens, 1.100 `trip_id` distintos, 50 ids com exatamente 2 cópias, 0 fora do 1x/2x**.
+  Pelas regras do Silver saem 115 ids "sujos": os 100 injetados (25 por motivo) mais **15 que já
+  vêm sujos do TLC** no primeiro milhar (14 tarifas negativas e 1 corrida de duração zero) — o Dia 6
+  vai contá-los como `invalid` também.
+- **100k sem freio (`RATE=0`)**: 2,3 s = **42.785 ev/s**, 0 falhas, 0 sem confirmação; o high
+  watermark por partição soma exatamente **100.000** (10.075–24.801). É o teto do produtor; o
+  consumidor do Dia 5 não precisa acompanhar isso em local mode, mas o número fica medido.
+- **Inválidos que já existem no dado**: nos mesmos 100k (jan/2024 em ordem de pickup), **1.579
+  linhas reais** violam as regras do Silver — 1.545 tarifa negativa, 35 duração não positiva, 0 zona
+  nula, 0 acima do teto. Logo o `invalid` do Dia 6 será `100 injetados + 1.579 reais`; comparar com
+  100 seco daria falso negativo.
+
+Decisões das flags:
+
+1. **`--dupes N` reenvia o mesmo payload logo depois do original** (mesmo `trip_id`, mesma key):
+   duplicata exata, que é o que o Dia 6 precisa para provar o `ON CONFLICT DO NOTHING`.
+2. **`--dirty N` deriva do evento atual**, com `event_time` deslocado `seq + 1` s: o `trip_id` sai
+   único (não vira duplicata) e o evento fica no ponto do stream, sem cair no filtro de atraso do
+   Dia 6. O motivo cicla em `DIRTY_KINDS` (`pickup_zone_null`, `non_positive_duration`,
+   `negative_fare`, `fare_over_ceiling`), então `--dirty 4` já cobre as quatro regras.
+3. **`--limit` conta só eventos reais**: injeção é extra, e o log final separa `enviados`,
+   `duplicatas` e `sujos`. Se a injeção passar do total do stream, a sobra sai ancorada no último
+   evento real — o contrato é "injetar N", não "injetar até N".
+4. **O ritmo (`--rate`) conta todas as mensagens produzidas**, não só as reais: o ev/s medido é o do
+   broker, e injeção não pode virar rajada de graça.
+5. **Teto de sanidade = 10.000** (`FARE_CEILING` em `schema.py`): o mesmo número que o Silver vai usar
+   no `is_valid_trip` do Dia 6 — um lugar só para mudar.
+
+Tropeços: o assert da minha verificação esperava 1.050 ids distintos (1.000 reais + 50 duplicatas) e
+deu 1.100 — duplicata repete id, então 1.000 reais + 100 sujos = 1.100; corrigido e repetido. E a
+primeira versão do `--dirty` injetava no máximo um sujo por evento real: com `--limit 3 --dirty 4`
+saíam 3; o teste de contagem pegou, e agora a sobra é injetada ao final.
+
+### Revisão independente do Dia 4 (o que mudou)
+
+Aplicado:
+
+- **`--dirty` limitado a 300 s** (`MAX_DIRTY_AHEAD_S`): o sujo adia o `event_time` até N segundos; com
+  N perto dos 10 min do filtro de atraso, ele empurraria o max e os reais seguintes pareceriam
+  atrasados. `parse_args` recusa acima de 300 e há teste.
+- **`AbortReplay` marca `aborted`**: o exit 1 não depende mais só de `delivery_failures`/`pending`.
+  Teste novo com um producer que recusa todas as entregas cobre esse caminho.
+- **ev/s do log separa reais e broker**: a injeção conta no ritmo, mas o teto de 42.785 ev/s é sem
+  injeção — as sobras de `--dupes/--dirty` maiores que o stream também não são paced (só existem
+  quando N > stream).
+- **Testes novos**: id dourado `bc7cdc0e1cdc29bd` (mudar a fórmula trocaria todos os ids e quebraria
+  a idempotência entre versões), shift único entre ciclos de `DIRTY_KINDS`, `dropoff_at` nulo com
+  base não mutada, cap do `--dirty` e falha de entrega.
+- Help do `--dirty` corrigido: os motivos **ciclam** em `DIRTY_KINDS` (com 100 são 25 de cada), não
+  "um por motivo".
+
+Contrato do Dia 6 (achado alto, corrigido no plano e na spec antes de implementar):
+
+1. As **quatro** regras de invalidez são as do Dia 2: `trip_id` nulo, `pickup_zone_id` nulo,
+   `trip_duration <= 0`, `fare_amount < 0` e `total_amount > 10.000`. Plano e spec listavam só três;
+   sem zona nula e teto, metade dos sujos entraria como válida (`invalid` cairia para 50 + 1.579).
+2. **Ordem**: validação → filtro de atraso → upsert (dedup no destino). Os contadores saem do
+   resultado do upsert: `invalid` = linhas gravadas com `is_valid_trip = false`, `duplicates_dropped`
+   = conflitos. Assim a reconciliação fecha: `graváveis válidos + invalid + late_dropped +
+   duplicates_dropped = consumidos`.
+3. **A primeira corrida de jan/2024 em ordem de pickup é um outlier de 2002-12-31 com tarifa −6,5**,
+   logo uma das 50 duplicatas é de um evento já inválido. No cenário do Dia 6 (100k, 100 sujos, 50
+   duplicatas): `invalid = 1.679` (1.579 reais + 100 sujos gravados) e `duplicates_dropped = 50`; a
+   duplicata inválida conta só como duplicata.
+4. **Watermark do lote anterior**: se o Dia 6 filtrar atraso com o max do próprio lote, o outlier de
+   2002 (primeiro evento do 100k) vira `late_dropped`; a spec manda guardar o max do lote anterior.
+
+Risco latente: `FARE_CEILING` mora em `producer/schema.py`. O job do Dia 6 precisa importar do
+pacote (ou repetir o shim de `sys.path` do produtor) para o teto não virar segunda definição.

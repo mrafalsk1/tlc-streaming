@@ -18,7 +18,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 # Campos do evento, na ordem em que saem no JSON (documental: é o contrato do tópico).
@@ -141,3 +141,58 @@ def partition_key(event: Mapping[str, Any]) -> bytes:
 def dumps(event: Mapping[str, Any]) -> bytes:
     """Serialização compacta (sem espaços) do evento."""
     return json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+# Motivos de invalidez que o Silver vai recusar (ver docs/notes.md, decisões do Dia 2). `trip_id`
+# nulo não entra aqui: o produtor sempre gera um id — esse caso só existe se a deserialização falhar.
+DIRTY_KINDS: tuple[str, ...] = (
+    "pickup_zone_null",
+    "non_positive_duration",
+    "negative_fare",
+    "fare_over_ceiling",
+)
+
+# Teto de sanidade da tarifa (política do Silver, Dia 6). Acima disso o evento nasce inválido.
+FARE_CEILING = 10_000.0
+
+
+def build_dirty_event(
+    base: Mapping[str, Any], seq: int, emit_time: datetime
+) -> dict[str, Any]:
+    """Evento sintético que o Silver deve marcar como ``is_valid_trip = false``.
+
+    Derivado do último evento real, com ``event_time`` deslocado ``seq + 1`` segundos: o
+    ``trip_id`` sai único (não vira duplicata) e o evento continua próximo do ponto do stream, sem
+    cair no filtro de atraso. O motivo cicla por ``DIRTY_KINDS``, então uma injeção de 4 já cobre
+    todas as regras de invalidez.
+    """
+    kind = DIRTY_KINDS[seq % len(DIRTY_KINDS)]
+    shift = timedelta(seconds=seq + 1)
+    event_time = datetime.fromisoformat(base["event_time"]) + shift
+    dropoff_at = base["dropoff_at"]
+    if dropoff_at is not None:
+        dropoff_at = format_naive(datetime.fromisoformat(dropoff_at) + shift)
+
+    event = dict(base)
+    event["event_time"] = format_naive(event_time)
+    event["dropoff_at"] = dropoff_at
+    event["emit_time"] = emit_time.isoformat(timespec="milliseconds")
+
+    if kind == "pickup_zone_null":
+        event["pickup_zone_id"] = None
+    elif kind == "non_positive_duration":
+        event["dropoff_at"] = event["event_time"]
+    elif kind == "negative_fare":
+        event["fare_amount"] = -1.0 * (seq + 1)
+        event["total_amount"] = -1.0 * (seq + 1)
+    else:  # fare_over_ceiling
+        event["total_amount"] = FARE_CEILING + seq + 1
+
+    event["trip_id"] = make_trip_id(
+        event["event_time"],
+        event["dropoff_at"],
+        event["pickup_zone_id"],
+        event["dropoff_zone_id"],
+        event["total_amount"],
+    )
+    return event

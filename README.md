@@ -4,12 +4,12 @@ Streaming pipeline over the NYC TLC trip records: a Python producer replays the 
 events into Redpanda (Kafka API), Spark Structured Streaming validates and lands them in a Bronze
 (Parquet) and a Silver layer (Postgres), and dbt models the Gold layer on top of Silver.
 
-**Status:** under construction (day 3 of 15). Numbers and diagrams land as they are measured — nothing
+**Status:** under construction (day 4 of 15). Numbers and diagrams land as they are measured — nothing
 in this README is estimated.
 
 ```
 Parquet TLC
-   │  producer (replay in pickup_at order, rate limited)        ← implemented (day 3)
+   │  producer (replay in pickup_at order, rate limited)        ← implemented (day 3; tests + --dupes/--dirty on day 4)
    ▼
 Redpanda  topic: trips.raw (6 partitions, key = pickup_zone_id, retention 24h)
    │
@@ -31,8 +31,14 @@ make silver  # applies the Silver DDL (idempotent)
 make smoke   # Spark local up on JDK 21
 make topic   # creates trips.raw with 6 partitions
 make produce # replays a 20k-event sample at 500 ev/s (RATE=0 LIMIT=0 for the full run)
+make test    # pytest of the producer (schema, serialisation, trip_id, pacing, injection)
+make lint    # ruff on producer and tests
 make down    # keeps the volumes
 ```
+
+`make produce DUPES=50 DIRTY=100` injects exact duplicates and invalid events (the day-6 dedup and
+validation proof needs them in a known amount; naturally invalid rows also exist in the TLC data and
+are counted too).
 
 ## Design decisions
 
