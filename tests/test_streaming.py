@@ -65,7 +65,7 @@ def test_parse_events_keeps_values_and_order(spark: SparkSession) -> None:
 
     assert frame.columns == list(EVENT_FIELDS) + ["kafka_partition", "kafka_offset"]
     assert row.trip_id == EVENT["trip_id"]
-    # Timestamp fica texto no Bronze: quem interpreta o fuso é o Silver (Dia 6).
+    # Timestamp fica texto no Bronze: quem interpreta o fuso é o Silver.
     assert row.event_time == EVENT["event_time"]
     assert row.emit_time == EVENT["emit_time"]
     assert row.pickup_zone_id == 114

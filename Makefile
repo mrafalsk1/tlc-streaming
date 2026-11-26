@@ -2,15 +2,15 @@
 COMPOSE := docker compose
 TOPIC ?= trips.raw
 
-# Replay de amostra (Dia 3). Run completo: `make produce RATE=0 LIMIT=0`.
-# DUPES/DIRTY injetam duplicatas e eventos inválidos (Dia 6): `make produce DUPES=50 DIRTY=100`.
+# Replay de amostra. Run completo: `make produce RATE=0 LIMIT=0`.
+# DUPES/DIRTY injetam duplicatas e eventos inválidos: `make produce DUPES=50 DIRTY=100`.
 RATE ?= 500
 LIMIT ?= 20000
 DUPES ?= 0
 DIRTY ?= 0
 RAW_DIR ?= $(HOME)/projetos/tlc-elt/data/raw
 
-# Dia 5: job Spark → Bronze. `STREAM_ARGS="--available-now"` processa o que existe e encerra.
+# Job Spark → Bronze. `STREAM_ARGS="--available-now"` processa o que existe e encerra.
 JARS_DIR ?= jars
 STREAM_ARGS ?=
 BRONZE_ARGS ?=
@@ -43,7 +43,7 @@ produce: ## Replay do TLC Parquet para trips.raw (RATE=500 LIMIT=20000; 0 = sem 
 	  test "$$parts" = "6" || { echo "topico $(TOPIC) com particoes=$${parts:-0} (esperado 6) — rode 'make topic'"; exit 1; }
 	@uv run python producer/producer.py --rate $(RATE) --limit $(LIMIT) --dupes $(DUPES) --dirty $(DIRTY) --topic $(TOPIC) --raw-dir $(RAW_DIR)
 
-test: ## Roda o pytest do producer e do job de streaming (Dia 5)
+test: ## Roda o pytest do producer e do job de streaming
 	@uv run pytest -q
 
 lint: ## ruff no producer, no streaming e nos testes
@@ -71,7 +71,7 @@ stream: check-java ## Consome trips.raw e grava o Bronze (Ctrl+C encerra; STREAM
 bronze: ## Conta o Bronze em Parquet (BRONZE_ARGS=--check conta nulos e offsets repetidos)
 	@uv run python scripts/count_bronze.py --dir data/bronze $(BRONZE_ARGS)
 
-bronze-reset: ## Apaga o Bronze e o checkpoint dele (só laboratório: refaz o Dia 5 do zero)
+bronze-reset: ## Apaga o Bronze e o checkpoint dele (só laboratório)
 	@rm -rf data/bronze data/checkpoints/bronze
 	@echo "bronze e checkpoint apagados"
 
@@ -79,7 +79,7 @@ silver: ## Aplica o DDL do schema Silver no Postgres (idempotente)
 	@$(COMPOSE) ps --status running --services | grep -qx postgres || { echo "postgres parado — rode 'make up'"; exit 1; }
 	@$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -U stream -d streaming < scripts/init_silver.sql
 
-silver-reset: ## DROP + recria o Silver (só até o Dia 8; do Dia 9 em diante o schema é congelado)
+silver-reset: ## DROP + recria o Silver (só laboratório: o schema é congelado depois do restart test)
 	@$(COMPOSE) ps --status running --services | grep -qx postgres || { echo "postgres parado — rode 'make up'"; exit 1; }
 	@$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -U stream -d streaming -c 'DROP SCHEMA IF EXISTS silver CASCADE'
 	@$(MAKE) --no-print-directory silver

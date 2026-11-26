@@ -1,8 +1,8 @@
-# Notas de execução — evidências e decisões
+# Notas técnicas — evidências e decisões
 
-Arquivo de apoio interno (pt-BR). Os números oficiais do README saem daqui, sempre medidos.
+Notas de engenharia do pipeline. Os números oficiais do README saem daqui, sempre medidos.
 
-## Dia 2 — toolchain e schema Silver (25/11/2026)
+## Toolchain e schema Silver
 
 Instalado: `uv 0.13.10`, `jdk21-openjdk 21.0.13.1`, Python 3.12.13 na `.venv`
 (11 pacotes do `requirements.txt`).
@@ -18,31 +18,31 @@ Tropeços: `pacman -S` falhou com 404 em `jdk21/nss/nspr/uv` (DB local à frente
 resolvido com `pacman -Syy`. `pandas` foi pinado em 2.3.3 porque o PySpark 4.3 avisa que não
 suporta pandas >= 3.
 
-### Decisões que os Dias 5–10 precisam respeitar
+### Decisões que o pipeline precisa respeitar
 
 1. **Linha inválida entra no Silver com `is_valid_trip = false`**, não é descartada.
    Inválido = `trip_id` nulo, `trip_duration <= 0`, `fare < 0`, `pickup_zone_id` nulo, tarifa acima
    do teto de sanidade. Consequências: `zone_demand_5min` só recebe `is_valid_trip = true`; e a
-   reconciliação do Dia 10 conta "gravados" = válidos e "inválidos" = linhas com flag falsa — a
+   reconciliação ponta a ponta conta "gravados" = válidos e "inválidos" = linhas com flag falsa — a
    mesma linha nunca entra nas duas parcelas.
 2. **`stream_state.watermark` NULL = "aceita tudo"**, não "descarta tudo". O primeiro lote grava
    `max(event_time)`; sem esse caso explícito, o filtro `event_time < watermark - 10 min` devolve
    NULL e o lote inteiro viraria `late_dropped`.
 3. **`duplicates_dropped` vem de `RETURNING (xmax = 0)`** (ou `DO NOTHING` + rowcount), nunca de
    `ON CONFLICT` silencioso: `DO UPDATE` conta insert e update igual e o contador ficaria zero.
-4. **A janela (Dia 8) sobrescreve** `trips`/`revenue` com `EXCLUDED.*`. Em `outputMode("update")`
+4. **A janela tumbling sobrescreve** `trips`/`revenue` com `EXCLUDED.*`. Em `outputMode("update")`
    o valor da janela é cumulativo; somar dobraria a cada micro-batch.
 5. **UTC nos dois lados**: `spark.sql.session.timeZone=UTC` no job e `SET TIME ZONE 'UTC'` na
    conexão do Silver. Sem isso, `now()` (TIMESTAMPTZ, TZ do servidor) e `event_time` (naive, TZ do
    JVM) se deslocam em silêncio.
 6. **Spark roda via `make`**, nunca por `uv run` solto: o `JAVA_HOME` do JDK 21 está pinado no
    `Makefile` (`:=` + `check-java`) e não vale num shell novo, que pegaria o JDK 27 default. Daí
-   `make smoke` hoje e `make stream` no Dia 5.
-7. **Schema congelado a partir do Dia 9** (o restart test depende do dado). Até lá, mudança de DDL é
-   `make silver-reset`, porque `CREATE TABLE IF NOT EXISTS` não altera tabela existente e o erro
+   `make smoke` e `make stream`.
+7. **Schema congelado depois do restart test** (o teste depende do dado). Até então, mudança de DDL
+   é `make silver-reset`, porque `CREATE TABLE IF NOT EXISTS` não altera tabela existente e o erro
    aparece longe da causa (coluna inexistente no meio do `foreachBatch` = retry infinito do lote).
 
-## Dia 3 — producer: Parquet → JSON no tópico (25/11/2026)
+## Producer: Parquet → JSON no tópico
 
 `producer/schema.py` (schema explícito do evento + `trip_id`) e `producer/producer.py` (replay com
 `--rate`/`--limit`, key = zona, `acks=all` + idempotência, log de ev/s a cada 5 s).
@@ -55,12 +55,12 @@ Cheques verdes:
   independente, o mesmo aceite dá **40,5 s = 494 ev/s** — a diferença é a leitura/ordenação do mês
   (~0,4 s) que passou a ficar fora da âncora do ritmo; o log de janela fica em 500 ev/s.
 - Sem freio (`--rate 0`) a mesma leitura sai a **~4.100 ev/s** (2.000 eventos em 0,5 s, já incluindo a
-  ordenação do mês inteiro) — teto do produtor, a confirmar com 100k no Dia 4.
+  ordenação do mês inteiro) — teto do produtor (confirmado abaixo com 100k).
 - Determinismo: dois runs de 2.000 num tópico descartável (`trips.smoke`, apagado em seguida) →
   4.000 mensagens, **2.000 `trip_id` distintos, cada um exatamente 2×, 0 fora do 1x/2x**.
 - `rpk topic consume trips.raw -o start -n 3` → JSON com `trip_id`, `event_time` (pickup), `emit_time`
   (UTC) e `key` = `pickup_zone_id` (114, 48, 48 nas três primeiras).
-- `retention.ms` do tópico = `86400000` (`DYNAMIC_TOPIC_CONFIG`), como o Dia 1 pediu.
+- `retention.ms` do tópico = `86400000` (`DYNAMIC_TOPIC_CONFIG`), conforme o setup do tópico.
 
 Decisões do producer:
 
@@ -83,7 +83,7 @@ com `producer/__init__.py` mais uma linha que põe a raiz do repo no `sys.path` 
 Também: `# noqa: E402` no import foi acusado pelo ruff (`RUF100`, regra não habilitada no default);
 o import ficou sem `noqa`.
 
-### Revisão independente do Dia 3 (o que mudou)
+### Revisão independente (o que mudou)
 
 Aplicado:
 
@@ -97,8 +97,8 @@ Aplicado:
 - Amostras de erro limitadas a 5, com contador separado; comentário do `poll(0)` corrigido (ele serve
   callbacks de entrega, não drena a fila de produção).
 - `make produce` distingue "redpanda fora do ar" de "tópico ausente" e exige **6 partições**
-  (`retention.ms` já era conferido no Dia 1).
-- README: diagrama marca `producer` como implementado e Spark/Bronze/Silver/dbt como alvo (Dias 5–10).
+  (`retention.ms` já era conferido no setup).
+- README: diagrama marca `producer` como implementado e Spark/Bronze/Silver/dbt como alvo.
 
 Descartado, com motivo:
 
@@ -107,7 +107,7 @@ Descartado, com motivo:
   compara o multiconjunto de `trip_id`; nada a mudar.
 - **Filtrar pickup nulo em dois lugares** (produtor e `build_event`): é defesa em profundidade — o
   produtor evita a exceção no caminho quente e `build_event` continua recusando linha sem pickup.
-- **`EVENT_FIELDS` divergir do dict**: vira teste no Dia 4 (`tuple(event) == EVENT_FIELDS`), que é
+- **`EVENT_FIELDS` divergir do dict**: vira teste (`tuple(event) == EVENT_FIELDS`), que é
   onde a checagem paga; em runtime seria custo por evento.
 
 Follow-up da revisão (mesmo revisor), aplicado:
@@ -124,7 +124,7 @@ Follow-up da revisão (mesmo revisor), aplicado:
   **150 falhas de entrega, 0 sem confirmação**, exit 1 em 31,0 s (tudo estoura em `message.timeout`;
   nada sai como "0 falhas").
 
-A provar no Dia 5, antes de o Silver gravar:
+O que o ingest do Bronze confirma:
 
 - `emit_time` sai como `2026-11-25T19:06:16.482+00:00`: o Spark 4 aplica
   `spark.sql.session.timeZone` ao converter string com offset para `TimestampType`. Se o JSON real
@@ -134,7 +134,7 @@ A provar no Dia 5, antes de o Silver gravar:
 - Key `unknown` é só transporte (o payload tem `pickup_zone_id`); não fazer `cast(key AS int)`.
 - `trip_id` usa `total_amount` formatado em `%.2f`: corrida com mais casas colidiria no PK do Silver.
 
-## Dia 4 — testes, injeção e teto de throughput (25/11/2026)
+## Testes, injeção e teto de throughput
 
 `tests/test_schema.py` (contrato do evento) e `tests/test_producer.py` (ordenação, ritmo, flags e
 contabilidade), com `pytest.ini` (`pythonpath = .` — sem isso o pytest só põe `tests/` no
@@ -147,23 +147,23 @@ Cheques verdes:
 - Injeção ao vivo em `trips.smoke` (1.000 reais + 50 duplicatas + 100 sujos, tópico apagado depois):
   **1.150 mensagens, 1.100 `trip_id` distintos, 50 ids com exatamente 2 cópias, 0 fora do 1x/2x**.
   Pelas regras do Silver saem 115 ids "sujos": os 100 injetados (25 por motivo) mais **15 que já
-  vêm sujos do TLC** no primeiro milhar (14 tarifas negativas e 1 corrida de duração zero) — o Dia 6
-  vai contá-los como `invalid` também.
+  vêm sujos do TLC** no primeiro milhar (14 tarifas negativas e 1 corrida de duração zero) — o
+  Silver vai contá-los como `invalid` também.
 - **100k sem freio (`RATE=0`)**: 2,3 s = **42.785 ev/s**, 0 falhas, 0 sem confirmação; o high
-  watermark por partição soma exatamente **100.000** (10.075–24.801). É o teto do produtor; o
-  consumidor do Dia 5 não precisa acompanhar isso em local mode, mas o número fica medido.
+  watermark por partição soma exatamente **100.000** (10.075–24.801). É o teto do produtor; o job
+  de ingest não precisa acompanhar isso em local mode, mas o número fica medido.
 - **Inválidos que já existem no dado**: nos mesmos 100k (jan/2024 em ordem de pickup), **1.579
   linhas reais** violam as regras do Silver — 1.545 tarifa negativa, 35 duração não positiva, 0 zona
-  nula, 0 acima do teto. Logo o `invalid` do Dia 6 será `100 injetados + 1.579 reais`; comparar com
+  nula, 0 acima do teto. Logo o `invalid` do Silver será `100 injetados + 1.579 reais`; comparar com
   100 seco daria falso negativo.
 
 Decisões das flags:
 
 1. **`--dupes N` reenvia o mesmo payload logo depois do original** (mesmo `trip_id`, mesma key):
-   duplicata exata, que é o que o Dia 6 precisa para provar o `ON CONFLICT DO NOTHING`.
+   duplicata exata, que é o que o Silver precisa para provar o `ON CONFLICT DO NOTHING`.
 2. **`--dirty N` deriva do evento atual**, com `event_time` deslocado `seq + 1` s: o `trip_id` sai
-   único (não vira duplicata) e o evento fica no ponto do stream, sem cair no filtro de atraso do
-   Dia 6. O motivo cicla em `DIRTY_KINDS` (`pickup_zone_null`, `non_positive_duration`,
+   único (não vira duplicata) e o evento fica no ponto do stream, sem cair no filtro de atraso.
+   O motivo cicla em `DIRTY_KINDS` (`pickup_zone_null`, `non_positive_duration`,
    `negative_fare`, `fare_over_ceiling`), então `--dirty 4` já cobre as quatro regras.
 3. **`--limit` conta só eventos reais**: injeção é extra, e o log final separa `enviados`,
    `duplicatas` e `sujos`. Se a injeção passar do total do stream, a sobra sai ancorada no último
@@ -171,14 +171,14 @@ Decisões das flags:
 4. **O ritmo (`--rate`) conta todas as mensagens produzidas**, não só as reais: o ev/s medido é o do
    broker, e injeção não pode virar rajada de graça.
 5. **Teto de sanidade = 10.000** (`FARE_CEILING` em `schema.py`): o mesmo número que o Silver vai usar
-   no `is_valid_trip` do Dia 6 — um lugar só para mudar.
+   no `is_valid_trip` — um lugar só para mudar.
 
 Tropeços: o assert da minha verificação esperava 1.050 ids distintos (1.000 reais + 50 duplicatas) e
 deu 1.100 — duplicata repete id, então 1.000 reais + 100 sujos = 1.100; corrigido e repetido. E a
 primeira versão do `--dirty` injetava no máximo um sujo por evento real: com `--limit 3 --dirty 4`
 saíam 3; o teste de contagem pegou, e agora a sobra é injetada ao final.
 
-### Revisão independente do Dia 4 (o que mudou)
+### Revisão independente (o que mudou)
 
 Aplicado:
 
@@ -196,30 +196,31 @@ Aplicado:
 - Help do `--dirty` corrigido: os motivos **ciclam** em `DIRTY_KINDS` (com 100 são 25 de cada), não
   "um por motivo".
 
-Contrato do Dia 6 (achado alto, corrigido no plano e na spec antes de implementar):
+Contrato do Silver (achado alto, corrigido antes de implementar):
 
-1. As **quatro** regras de invalidez são as do Dia 2: `trip_id` nulo, `pickup_zone_id` nulo,
-   `trip_duration <= 0`, `fare_amount < 0` e `total_amount > 10.000`. Plano e spec listavam só três;
+1. As **quatro** regras de invalidez são as do schema Silver: `trip_id` nulo, `pickup_zone_id` nulo,
+   `trip_duration <= 0`, `fare_amount < 0` e `total_amount > 10.000`. A primeira versão do contrato
+   listava só três;
    sem zona nula e teto, metade dos sujos entraria como válida (`invalid` cairia para 50 + 1.579).
 2. **Ordem**: validação → filtro de atraso → upsert (dedup no destino). Os contadores saem do
    resultado do upsert: `invalid` = linhas gravadas com `is_valid_trip = false`, `duplicates_dropped`
    = conflitos. Assim a reconciliação fecha: `graváveis válidos + invalid + late_dropped +
    duplicates_dropped = consumidos`.
 3. **A primeira corrida de jan/2024 em ordem de pickup é um outlier de 2002-12-31 com tarifa −6,5**,
-   logo uma das 50 duplicatas é de um evento já inválido. No cenário do Dia 6 (100k, 100 sujos, 50
-   duplicatas): `invalid = 1.679` (1.579 reais + 100 sujos gravados) e `duplicates_dropped = 50`; a
+   logo uma das 50 duplicatas é de um evento já inválido. No cenário de 100k, 100 sujos e 50
+   duplicatas: `invalid = 1.679` (1.579 reais + 100 sujos gravados) e `duplicates_dropped = 50`; a
    duplicata inválida conta só como duplicata.
-4. **Watermark do lote anterior**: se o Dia 6 filtrar atraso com o max do próprio lote, o outlier de
-   2002 (primeiro evento do 100k) vira `late_dropped`; a spec manda guardar o max do lote anterior.
+4. **Watermark do lote anterior**: se o Silver filtrar atraso com o max do próprio lote, o outlier de
+   2002 (primeiro evento do 100k) vira `late_dropped`; o contrato manda guardar o max do lote anterior.
 
-Risco latente: `FARE_CEILING` mora em `producer/schema.py`. O job do Dia 6 precisa importar do
+Risco latente: `FARE_CEILING` mora em `producer/schema.py`. O job do Silver precisa importar do
 pacote (ou repetir o shim de `sys.path` do produtor) para o teto não virar segunda definição.
 
-## Dia 5 — Bronze
+## Bronze
 
 Feito: `streaming/schema.py` (schema explícito amarrado a `producer.schema.EVENT_FIELDS`),
 `streaming/job.py` (Kafka → Parquet), `scripts/fetch_jars.py`, `scripts/count_bronze.py`, alvos
-`make jars/stream/bronze/bronze-reset`, 6 testes novos (27 no total).
+`make jars/stream/bronze/bronze-reset`, e a suíte com 30 testes.
 
 ### Números medidos
 
@@ -238,8 +239,8 @@ Feito: `streaming/schema.py` (schema explícito amarrado a `producer.schema.EVEN
   `fetch_jars.py` procurava `~/.ivy2/jars` e `startswith("spark-sql-kafka")`, então baixou tudo e
   "não achou" nada. Agora o download usa um **Ivy dedicado** (`jars/.ivy`): os jars copiados são
   exatamente os que o POM do conector resolveu, sem pegar a `kafka-clients` mais nova de outro
-  projeto da máquina — o plano B de varrer `~/.ivy2*` e escolher a maior versão tem esse risco e foi
-  descartado.
+  projeto da máquina — a alternativa de varrer `~/.ivy2*` e escolher a maior versão tem esse risco e
+  foi descartada.
 - Só **4** artefatos faltam no `pyspark/jars`: `spark-sql-kafka`, `spark-token-provider-kafka`,
   `kafka-clients` e `commons-pool2` (o Spark traz `commons-pool` 1.5.4, que não serve). Copiar os
   11 resolvidos pelo Ivy duplicaria ~63 MB de hadoop/lz4/snappy que o Spark já tem.
@@ -248,7 +249,7 @@ Feito: `streaming/schema.py` (schema explícito amarrado a `producer.schema.EVEN
   errada — o teste pegou. Correção: sessão em UTC + `to_date`/`hour` direto, e
   `add_ingest_columns` **falha** se a sessão não estiver em UTC em vez de gravar pasta errada.
 
-### Contrato para o Dia 6
+### Contrato para o Silver
 
 - Bronze guarda `event_time`/`dropoff_at` como **texto** (naive de NY): o cast para timestamp é do
   Silver, com a sessão fixada no fuso de NY; não inferir fuso no ingest.
@@ -260,7 +261,7 @@ Feito: `streaming/schema.py` (schema explícito amarrado a `producer.schema.EVEN
 ### Risco latente
 
 - `kafka.group.id` fixo faz o Spark avisar que é "unsafe": duas queries simultâneas com o mesmo
-  grupo brigam por partições. No lab há uma query só; o Dia 9 vai matar e subir de novo — por isso
+  grupo brigam por partições. No lab há uma query só; o restart test vai matar e subir de novo — por isso
   `kafka.session.timeout.ms=10000` (default 45 s) para o coordenador liberar o consumidor morto
   rápido. Se o restart ainda demorar, olhar isso antes de culpar o checkpoint.
 

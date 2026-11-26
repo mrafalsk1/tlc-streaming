@@ -1,8 +1,8 @@
-"""Conta o Bronze em Parquet **sem subir JVM** — verificação do Dia 5.
+"""Conta o Bronze em Parquet **sem subir JVM** — verificação do ingest.
 
 `pyarrow.dataset` lê só o metadado dos arquivos para o total de linhas (rápido mesmo com muitos
 arquivos) e entende as pastas Hive-style `ingest_date=/hour=/` geradas pelo job. Com `--check`,
-lê também `trip_id` e a posição no Kafka para responder as duas perguntas que o Dia 9 vai cobrar:
+lê também `trip_id` e a posição no Kafka para responder as duas perguntas do restart test:
 quantos eventos chegaram sem `trip_id` (corrompidos) e quantas linhas repetem
 `(kafka_partition, kafka_offset)` (o at-least-once do Bronze).
 

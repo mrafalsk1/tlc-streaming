@@ -7,7 +7,7 @@ pequena decide tipo errado e transforma `pickup_zone_id` em `string` só porque 
 Os nomes vêm de `producer.schema.EVENT_FIELDS` justamente para as duas pontas não divergirem em
 silêncio (há teste amarrando a ordem). Os dois tempos ficam **texto** no Bronze de propósito: é a
 camada crua, e converter "2024-01-01T00:12:00" (naive, hora local de NY) em timestamp já escolheria
-um fuso no ingest. Quem interpreta o relógio é o Silver (Dia 6), com o fuso fixado no job.
+um fuso no ingest. Quem interpreta o relógio é o Silver, com o fuso fixado no job.
 """
 
 from __future__ import annotations

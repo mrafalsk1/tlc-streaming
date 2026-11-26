@@ -1,9 +1,9 @@
 -- DDL do schema Silver (Postgres 5434, banco streaming).
 -- Idempotente: `make silver` pode rodar quantas vezes quiser, não apaga dado.
--- ATENÇÃO: `IF NOT EXISTS` NÃO altera tabela existente. Até o Dia 8, mudança de coluna
--- é `make silver-reset`; do Dia 9 em diante o schema é congelado (o restart test depende do dado).
+-- ATENÇÃO: `IF NOT EXISTS` NÃO altera tabela existente. Mudança de coluna é `make silver-reset`;
+-- depois do restart test o schema é congelado (o teste depende do dado).
 --
--- Dois tipos de tempo, de propósito (ver ESPECIFICACAO.md §"Dois tempos, não um"):
+-- Dois tipos de tempo, de propósito (ver docs/notes.md):
 --   * event_time / pickup_at / dropoff_at  -> TIMESTAMP (naive, hora local de NY como o TLC publica)
 --   * emit_time / ingested_at / updated_at -> TIMESTAMPTZ (instante de parede do producer/consumer)
 -- lag_seconds = ingested_at - emit_time (latência do pipeline), nunca ingested_at - event_time
@@ -14,8 +14,8 @@ BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS silver;
 
--- 1 linha por trip_id. A PK é onde a dedup de verdade acontece (Dia 7).
--- Linha inválida ENTRA aqui com is_valid_trip = false (política do Dia 6, ver docs/notes.md).
+-- 1 linha por trip_id. A PK é onde a dedup de verdade acontece.
+-- Linha inválida ENTRA aqui com is_valid_trip = false (política do Silver, ver docs/notes.md).
 CREATE TABLE IF NOT EXISTS silver.trip_events (
     trip_id          TEXT PRIMARY KEY,
     pickup_at        TIMESTAMP      NOT NULL,
@@ -33,13 +33,13 @@ CREATE TABLE IF NOT EXISTS silver.trip_events (
     lag_seconds      DOUBLE PRECISION
 );
 
--- Consultas de reconciliação (Dia 10) e da janela por zona (Dia 8) varrem por pickup_at.
+-- Consultas de reconciliação ponta a ponta e da janela por zona varrem por pickup_at.
 CREATE INDEX IF NOT EXISTS trip_events_pickup_at_idx
     ON silver.trip_events (pickup_at);
 CREATE INDEX IF NOT EXISTS trip_events_zone_pickup_idx
     ON silver.trip_events (pickup_zone_id, pickup_at);
 
--- Zona x janela tumbling de 5 min. PK composta = chave do upsert do Dia 8.
+-- Zona x janela tumbling de 5 min. PK composta = chave do upsert da janela.
 CREATE TABLE IF NOT EXISTS silver.zone_demand_5min (
     pickup_zone_id   INTEGER       NOT NULL,
     window_start     TIMESTAMP     NOT NULL,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS silver.zone_demand_5min (
     CONSTRAINT zone_demand_5min_window_5min CHECK (window_end = window_start + interval '5 minutes')
 );
 
--- Uma linha só: watermark = max(event_time) do lote anterior, base do filtro de atraso próprio (Dia 6).
+-- Uma linha só: watermark = max(event_time) do lote anterior, base do filtro de atraso próprio.
 -- watermark NULL = "primeiro lote, aceita tudo" (NÃO é "descarta tudo").
 CREATE TABLE IF NOT EXISTS silver.stream_state (
     id         SMALLINT    PRIMARY KEY DEFAULT 1 CHECK (id = 1),

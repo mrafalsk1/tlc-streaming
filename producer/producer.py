@@ -1,4 +1,4 @@
-"""Replay dos Parquet do TLC para o tópico ``trips.raw`` (Dia 3).
+"""Replay dos Parquet do TLC para o tópico ``trips.raw``.
 
     uv run python producer/producer.py --rate 500 --limit 20000
 
@@ -8,7 +8,7 @@ cronológica global (é o que impede quase todo evento de nascer "atrasado"). Ke
 
 ``--rate 0`` desliga o freio e ``--limit 0`` replaya os arquivos inteiros. ``--dupes N`` reenvia
 N eventos (mesmo payload, mesmo ``trip_id``) e ``--dirty N`` injeta N eventos inválidos com id único
-— as duas flags existem para o Dia 6 provar dedup e validação de verdade.
+— as duas flags existem para o Silver provar dedup e validação de verdade.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--brokers", default=DEFAULT_BROKERS, help=f"default: {DEFAULT_BROKERS}")
     parser.add_argument("--topic", default="trips.raw")
-    parser.add_argument("--dupes", type=int, default=0, help="duplicatas exatas a injetar (Dia 6)")
+    parser.add_argument("--dupes", type=int, default=0, help="duplicatas exatas a injetar")
     parser.add_argument(
         "--dirty",
         type=int,
@@ -206,7 +206,7 @@ def run(args: argparse.Namespace) -> int:
                 last_event = event
                 sent += 1
                 window_count += 1
-                # Injeção (Dia 6): duplicata é o mesmo payload de novo; sujo é derivado do evento
+                # Injeção: duplicata é o mesmo payload de novo; sujo é derivado do evento
                 # atual, com trip_id único e motivo de invalidez ciclando em DIRTY_KINDS.
                 if dupes_sent < args.dupes:
                     send(event)
@@ -232,7 +232,7 @@ def run(args: argparse.Namespace) -> int:
                     window_start = now
                     window_count = 0
         # --dupes/--dirty maiores que o stream: o que sobrou sai ancorado no último evento real
-        # (contrato das flags é "injetar N" — o contador do Dia 6 precisa bater com o pedido).
+        # (contrato das flags é "injetar N" — o contador do Silver precisa bater com o pedido).
         if last_event is not None:
             while dupes_sent < args.dupes:
                 send(last_event)

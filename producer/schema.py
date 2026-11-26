@@ -4,7 +4,7 @@ O dataset do TLC não tem id de corrida, então o id é derivado do conteúdo do
 (`sha1(pickup|dropoff|pu_zone|do_zone|total)[:16]`): reexecutar o replay gera os mesmos ids, que é o
 que permite provar a idempotência do Silver.
 
-Dois tempos, de propósito (ver `docs/notes.md` e `ESPECIFICACAO.md` §"Dois tempos, não um"):
+Dois tempos, de propósito (ver `docs/notes.md`):
 
 * ``event_time`` — pickup em hora local de NY (o TLC publica timestamp naive); dirige janela e
   watermark. É o `pickup_at` do dataset; o job do Silver deriva `pickup_at` dele em vez de repetir a
@@ -143,7 +143,7 @@ def dumps(event: Mapping[str, Any]) -> bytes:
     return json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-# Motivos de invalidez que o Silver vai recusar (ver docs/notes.md, decisões do Dia 2). `trip_id`
+# Motivos de invalidez que o Silver vai recusar (ver docs/notes.md, decisões de modelagem). `trip_id`
 # nulo não entra aqui: o produtor sempre gera um id — esse caso só existe se a deserialização falhar.
 DIRTY_KINDS: tuple[str, ...] = (
     "pickup_zone_null",
@@ -152,7 +152,7 @@ DIRTY_KINDS: tuple[str, ...] = (
     "fare_over_ceiling",
 )
 
-# Teto de sanidade da tarifa (política do Silver, Dia 6). Acima disso o evento nasce inválido.
+# Teto de sanidade da tarifa (política do Silver). Acima disso o evento nasce inválido.
 FARE_CEILING = 10_000.0
 
 

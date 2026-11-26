@@ -4,7 +4,7 @@ set -euo pipefail
 
 TOPIC="${TOPIC:-trips.raw}"
 PARTITIONS="${PARTITIONS:-6}"
-RETENTION_MS="${RETENTION_MS:-86400000}"   # 24 h: o run oficial do Dia 14 dura ~5 h
+RETENTION_MS="${RETENTION_MS:-86400000}"   # 24 h: o replay completo de jan–mar dura ~5 h
 
 # Numa máquina limpa, `make up` retorna antes do healthcheck fechar (até 60 s).
 # Esperar aqui evita que o `describe` falhe por broker indisponível e o `set -e` aborte.

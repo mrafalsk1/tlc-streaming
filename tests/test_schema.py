@@ -41,7 +41,7 @@ def row(**overrides: Any) -> dict[str, Any]:
 
 
 def test_event_fields_in_order() -> None:
-    """O dict do evento segue `EVENT_FIELDS` — o teste que o Dia 3 deixou para hoje."""
+    """O dict do evento segue `EVENT_FIELDS` — o teste que fecha o contrato do tópico."""
     assert tuple(build_event(row(), EMIT)) == EVENT_FIELDS
 
 

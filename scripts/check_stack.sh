@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Valida o Dia 1: containers de pé, tópico com 6 partições, retenção 24 h, portas respondendo.
+# Valida o ambiente: containers de pé, tópico com 6 partições, retenção 24 h, portas respondendo.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
