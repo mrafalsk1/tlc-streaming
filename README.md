@@ -4,8 +4,9 @@ Streaming pipeline over the NYC TLC trip records: a Python producer replays the 
 events into Redpanda (Kafka API), Spark Structured Streaming validates and lands them in a Bronze
 (Parquet) and a Silver layer (Postgres), and dbt models the Gold layer on top of Silver.
 
-**Status:** under construction (day 5 of 15). Numbers and diagrams land as they are measured — nothing
-in this README is estimated.
+**Status:** day 5 of 15 — the producer and the Bronze layer are running; Silver (validation, late
+data, upsert) is next. Numbers and diagrams land as they are measured — nothing in this README is
+estimated.
 
 ```
 Parquet TLC
