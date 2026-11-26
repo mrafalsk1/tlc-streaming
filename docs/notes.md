@@ -252,11 +252,13 @@ Feito: `streaming/schema.py` (schema explícito amarrado a `producer.schema.EVEN
 ### Contrato para o Silver
 
 - Bronze guarda `event_time`/`dropoff_at` como **texto** (naive de NY): o cast para timestamp é do
-  Silver, com a sessão fixada no fuso de NY; não inferir fuso no ingest.
+  Silver, com a sessão em **UTC** e o relógio de parede preservado (`to_timestamp` de texto naive
+  não desloca); não inferir fuso no ingest.
 - Bronze tem inválidos e atrasados de propósito; `is_valid_trip` e o filtro de atraso nascem no
   Silver, não aqui.
-- `spark.sql.session.timeZone=UTC` é do job do Bronze. O job do Silver precisa de outro valor e não
-  deve reutilizar `add_ingest_columns` sem revisar a guarda.
+- `spark.sql.session.timeZone=UTC` vale para os dois ramos: mantém a partição do Bronze estável e
+  faz `emit_time`/`ingested_at` virarem instantes corretos. O Silver **não** reutiliza
+  `add_ingest_columns` (aquela guarda de partição é do Bronze).
 
 ### Risco latente
 
@@ -264,4 +266,66 @@ Feito: `streaming/schema.py` (schema explícito amarrado a `producer.schema.EVEN
   grupo brigam por partições. No lab há uma query só; o restart test vai matar e subir de novo — por isso
   `kafka.session.timeout.ms=10000` (default 45 s) para o coordenador liberar o consumidor morto
   rápido. Se o restart ainda demorar, olhar isso antes de culpar o checkpoint.
+
+## Silver
+
+`streaming/silver.py` + o ramo `foreachBatch` de `streaming/job.py`: valida, filtra atraso pelo
+`silver.stream_state` e faz upsert em `silver.trip_events` (PK `trip_id`). O Bronze continua cru:
+inválido e atrasado entram no Parquet.
+
+### Números medidos
+
+Cenário 100k + 50 duplicatas + 100 sujos, drenado em 3 lotes (49.997 + 49.998 + 155):
+
+- consumidos **100.150** = válidos **98.421** + inválidos **1.679** + atrasados **0** + duplicados
+  **50** + rejeitados **0**. A conta fecha.
+- `invalid` = 1.579 linhas reais do TLC + 100 sujos injetados. O detalhe por regra (25 zona nula,
+  1.571 tarifa negativa, 60 duração não positiva, 25 acima do teto) soma 1.681 porque duas linhas
+  violam duas regras — o contador de linhas é 1.679.
+- `silver.trip_events`: **100.100 linhas = 100.100 `trip_id` distintos**; as 50 duplicatas nunca
+  viraram linha.
+- Bronze: **100.150 linhas, 18 arquivos, 0 `trip_id` nulo, 100.150 pares
+  `(kafka_partition, kafka_offset)` distintos**.
+- Segunda execução com o mesmo checkpoint: 0 lote — Bronze, Silver e contadores inalterados.
+- `pickup_at` sem deslocamento: mínimo `2002-12-31 22:59:39` (outlier do TLC) e máximo
+  `2024-01-02 11:02:23`. `lag_seconds` (emit → ingest) varia com o backlog do dreno; não é medida
+  de latência de regime, que fica para o `metrics.py`.
+- `stream_state.watermark` termina em `2024-01-02 11:01:48`, o menor máximo por partição (o maior
+  era `11:02:23`).
+
+### Decisões
+
+1. **Watermark = menor dos `max(event_time)` por partição** do lote anterior. O replay é
+   particionado por zona e o teto de offsets é dividido entre as partições, então elas avançam em
+   ritmos de event-time diferentes: no probe do Bronze, na altura do offset 6.000 a partição 3
+   estava em `07:59` e a partição 5 em `13:42` (~6 h de diferença). Com o **máximo global**, um dreno
+   de 50k por lote marcou **9.014 linhas** como `late_dropped` sem nenhuma estar atrasada. O menor
+   máximo é o ponto até onde todos os inputs avançaram; dentro de cada partição a ordem é preservada
+   pelo producer, então não há falso positivo, e o resultado é o mesmo com lote de 8k ou 50k.
+2. **Contadores saem do upsert**: `RETURNING (xmax = 0)` separa insert de update; `invalid` = insert
+   com flag falsa e `duplicates_dropped` = linha do COPY que não virou insert (duplicata dentro do
+   lote ou conflito com linha existente). Duplicata de inválido conta só como duplicata.
+3. **`DISTINCT ON (trip_id)` antes do `INSERT`**: `ON CONFLICT DO UPDATE` recusa afetar a mesma
+   linha duas vezes na mesma instrução; a duplicata que chega no mesmo micro-lote precisa ser
+   colapsada antes.
+4. **`trip_id` nulo não entra**: a PK não aceita nulo, então a linha vai para `rejected` (e continua
+   no Bronze). O mesmo para `pickup_at` nulo (`NOT NULL`). Nenhum dos dois apareceu no cenário.
+5. **COPY para tabela temporária** em vez de `execute_values` (não existe mais no psycopg 3.3):
+   `CREATE TEMP TABLE ... ON COMMIT DROP` + COPY + `INSERT ... SELECT`. A transação inteira
+   (watermark lido, upsert, watermark gravado) é um commit só: lote repetido pelo checkpoint vê o
+   mesmo watermark e decide o mesmo.
+
+### O que doeu
+
+- **`collect()` de `TIMESTAMP` usa o fuso local do driver**, não `spark.sql.session.timeZone`. Na
+  máquina em UTC-3, `pickup_at` de NY saía 3 h atrás e `lag_seconds` ganhava 3 h — o teste pegou
+  (`datetime(2024, 1, 1, 0, 12)` virava `2023-12-31 21:12`). Correção: as colunas de tempo vão para o
+  COPY como texto (`date_format` na sessão UTC) e o Postgres recebe a string com
+  `SET TIME ZONE 'UTC'`. O watermark entra no Spark também como texto (`to_timestamp(lit(...))`);
+  um `datetime` naive no `lit` seria interpretado no fuso do driver.
+- **Os primeiros dois drenos perderam evento real**: 9.014 linhas "atrasadas" num e 6.015 por lote
+  no outro, todas em ordem. A causa não era o dado, era o watermark global contra partições
+  desalinhadas em event-time. O probe por partição no Bronze (`min/max` e `event_time` em offsets
+  redondos) foi o que mostrou a diferença de ~6 h entre fatias.
+
 

@@ -31,8 +31,9 @@ up: ## Sobe Redpanda, Console e Postgres
 down: ## Derruba os containers (mantém os volumes)
 	$(COMPOSE) down
 
-clean: ## Derruba e apaga os volumes (perde tópico e banco)
+clean: ## Derruba e apaga os volumes (perde tópico, banco e contadores)
 	$(COMPOSE) down -v
+	@rm -f data/state/counters.json
 
 topic: ## Cria o tópico trips.raw (idempotente)
 	@bash scripts/create_topic.sh
@@ -65,7 +66,7 @@ smoke: check-java ## Spark local sobe e conta 10, com o mesmo JAVA_HOME dos jobs
 jars: check-java ## Baixa o conector Kafka do Maven para jars/ (uma vez, com rede)
 	@uv run python scripts/fetch_jars.py --dest $(JARS_DIR)
 
-stream: check-java ## Consome trips.raw e grava o Bronze (Ctrl+C encerra; STREAM_ARGS=--available-now)
+stream: check-java ## Consome trips.raw e grava Bronze + Silver (Ctrl+C encerra; STREAM_ARGS=--available-now)
 	@uv run python -m streaming.job --jars-dir $(JARS_DIR) $(STREAM_ARGS)
 
 bronze: ## Conta o Bronze em Parquet (BRONZE_ARGS=--check conta nulos e offsets repetidos)
@@ -83,6 +84,13 @@ silver-reset: ## DROP + recria o Silver (só laboratório: o schema é congelado
 	@$(COMPOSE) ps --status running --services | grep -qx postgres || { echo "postgres parado — rode 'make up'"; exit 1; }
 	@$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -U stream -d streaming -c 'DROP SCHEMA IF EXISTS silver CASCADE'
 	@$(MAKE) --no-print-directory silver
+	@rm -f data/state/counters.json
+
+silver-stats: ## Contagem do Silver (linhas, trip_id distintos e inválidos)
+	@$(COMPOSE) exec -T postgres psql -U stream -d streaming -c "SELECT count(*) AS rows, count(DISTINCT trip_id) AS distinct_ids, count(*) FILTER (WHERE NOT is_valid_trip) AS invalid FROM silver.trip_events"
+
+counters: ## Mostra os contadores incrementais do Silver
+	@test -f data/state/counters.json && uv run python -m json.tool data/state/counters.json || echo "sem contadores ainda"
 
 ps: ## Estado dos containers
 	@$(COMPOSE) ps
@@ -90,4 +98,4 @@ ps: ## Estado dos containers
 logs: ## Logs do Redpanda
 	@$(COMPOSE) logs -f redpanda
 
-.PHONY: help up down clean topic produce test lint venv deps check-java smoke jars stream bronze bronze-reset silver silver-reset ps logs
+.PHONY: help up down clean topic produce test lint venv deps check-java smoke jars stream bronze bronze-reset silver silver-reset silver-stats counters ps logs
